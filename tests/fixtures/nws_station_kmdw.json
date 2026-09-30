@@ -1,0 +1,3 @@
+{"id": "https://api.weather.gov/stations/KMDW", "type": "Feature",
+ "geometry": {"type": "Point", "coordinates": [-87.75222, 41.78611]},
+ "properties": {"stationIdentifier": "KMDW", "name": "Chicago Midway Airport", "timeZone": "America/Chicago"}}

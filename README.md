@@ -62,6 +62,31 @@ The older single-city `[market] series_ticker` setting still works and shows up 
 
 On the command line, pass `--city SERIES` to `add-forecast`, `nws` and `refresh` when you follow more than one city.
 
+### Follow every city automatically
+
+With real data, `[market] follow_all = true` (the default) makes each update check Kalshi's list of daily-high-temperature series, at most every 6 hours, and follow any new city.
+
+- **Timezone and forecast location are filled in automatically**, in this order:
+  1. The settlement station named in the contract's settlement source or rules. For example an NWS climate-report link `…issuedby=MDW` or `CLIMDW` becomes station KMDW, which is looked up on the NWS stations API for exact coordinates and timezone (US stations).
+  2. A built-in list of stations public guides say Kalshi uses, marked "suggested — check".
+  3. The city centre from Open-Meteo's free geocoding, marked "approximate".
+- A city whose timezone can't be determined is **not** followed. It is listed under "Needs your attention" instead of being guessed.
+- The Cities page shows where every location came from and lets you change it.
+- **Stop following** works for automatic cities too, and they stay stopped.
+- **Follow all Kalshi weather cities now** on the Cities page, or `python -m kalshikommander follow-all`, runs discovery immediately.
+- Kalshi requests are paced (about 12 per second, with a back-off on HTTP 429). With 20+ cities an update takes on the order of a minute.
+
+### Review everything at once
+
+The **Review & approve** page collects what needs you across all cities:
+
+1. **Rules.** New cities' rules wordings are listed on one page with a single **accept all** button. Wordings that fail the automatic checks are never accepted, and a changed wording asks again.
+2. **Paper-buy signals.** Every current signal across all cities is shown in one table, all ticked. **Approve selected paper buys** re-checks prices first (re-snapshotting a city whose prices are over 2 minutes old). It simulates each trade only if it is still a paper-buy at the new prices, and it respects the risk limits.
+
+To skip even that click, set `[auto] paper_trade = true`: the auto-update then simulates every paper-buy signal itself. Approving everything, or using this option, gives the least biased test, because hand-picked trades measure your picks rather than the model. It is paper only; there is still no real-money code.
+
+On the Today page, city cards fold into a one-line summary when you follow more than three cities.
+
 ### Automatic forecasts (no typing needed)
 
 With real data, every **Update prices & forecasts** click also fetches today's and tomorrow's expected high for each city. The provider is set in `config.toml`:
@@ -116,9 +141,10 @@ Sample data and real data use separate databases: `data/sample.db` and `data/kal
 | `discover [--check-open]` | Find current daily-high-temperature series (public API). |
 | `refresh [--city SERIES]` | Snapshot today's and tomorrow's markets and order books (each city's own local dates). |
 | `cities` / `track SERIES --timezone TZ [--label NAME]` / `untrack SERIES` | List, follow or stop following cities. |
+| `follow-all` | Follow every Kalshi daily-high city now, with timezone and location filled in. |
 | `serve [--port N]` | Run the dashboard, bound to 127.0.0.1 only. |
 | `add-forecast [--city SERIES] --date 2026-10-01 --high 74 --unit F [--sigma 3] --issued 2026-09-30T16:00 --source "NWS forecast page" [--detail URL]` | Record a forecast. |
-| `update [--no-decisions] [--force]` | One-shot: refresh prices, fetch automatic forecasts, record decisions. |
+| `update [--no-decisions] [--force] [--paper-trade]` | One-shot: follow new cities, refresh prices, fetch forecasts and results, record decisions (and optionally simulate every paper-buy). |
 | `set-location SERIES LAT LON` | Set a city's forecast location. |
 | `serve --auto-update MINUTES` | Dashboard plus automatic updates every N minutes (minimum 5). |
 | `nws [--city SERIES] --date YYYY-MM-DD` | Record an NWS gridpoint forecast for one day by hand. |

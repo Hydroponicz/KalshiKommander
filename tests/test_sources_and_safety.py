@@ -38,7 +38,7 @@ def test_public_client_is_get_only_and_allowlisted():
         seen.append((req.get_method(), req.full_url, dict(req.header_items())))
         return FakeResp(json.dumps({"market": {"ticker": "X"}}).encode())
 
-    c = KalshiPublicClient(opener=opener)
+    c = KalshiPublicClient(opener=opener, min_interval=0)
     assert c.get_market("KXHIGHNY-26SEP30-T80")["ticker"] == "X"
     assert seen[0][0] == "GET" and "/markets/KXHIGHNY-26SEP30-T80" in seen[0][1]
     assert not any(k.lower().startswith("kalshi-access") or k.lower() == "authorization" for k in seen[0][2])

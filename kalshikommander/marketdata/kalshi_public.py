@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -36,9 +38,14 @@ class KalshiPublicClient(MarketDataSource):
     name = "kalshi_public"
     is_sample = False
 
-    def __init__(self, timeout: float = 15.0, opener=None):
+    # Gentle pacing: following many cities means hundreds of reads per update.
+    MIN_INTERVAL_S = 0.08
+
+    def __init__(self, timeout: float = 15.0, opener=None, min_interval: float | None = None):
         self.timeout = timeout
         self._open = opener or urllib.request.urlopen
+        self._min_interval = self.MIN_INTERVAL_S if min_interval is None else min_interval
+        self._last = 0.0
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         if not any(p.match(path) for p in _ALLOWED_PATHS):
@@ -49,8 +56,20 @@ class KalshiPublicClient(MarketDataSource):
         req = urllib.request.Request(url, method="GET", headers={
             "Accept": "application/json", "User-Agent": "KalshiKommander-research/0.1 (read-only)"})
         assert req.get_method() == "GET"
-        with self._open(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        for attempt in range(3):
+            wait = self._min_interval - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+            try:
+                with self._open(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:  # rate limited: back off and retry
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError("unreachable")
 
     def list_series(self) -> list[dict]:
         out, last_err = [], None

@@ -16,8 +16,10 @@ class RealLikeSource(SampleSource):
     is_sample = False
 
 
-def real_app(clock, cfg=None):
-    return App(cfg or AppConfig(), source=RealLikeSource(today=date(2026, 9, 30)), store=Store(":memory:"), clock=clock)
+def real_app(clock, cfg=None, follow_all=False):
+    cfg = cfg or AppConfig()
+    cfg.market.follow_all = follow_all  # tests stay offline unless they opt in with a fake opener
+    return App(cfg, source=RealLikeSource(today=date(2026, 9, 30)), store=Store(":memory:"), clock=clock)
 
 
 def test_timezone_guess():

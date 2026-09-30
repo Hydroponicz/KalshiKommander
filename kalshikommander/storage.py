@@ -109,6 +109,9 @@ class Store:
         if "series_ticker" not in cols:
             # NULL on pre-existing rows = forecast recorded before multi-city support
             self.conn.execute("ALTER TABLE forecasts ADD COLUMN series_ticker TEXT")
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(tracked_series)")}
+        if "origin" not in cols:
+            self.conn.execute("ALTER TABLE tracked_series ADD COLUMN origin TEXT")
 
     # -- generic -------------------------------------------------------------------------
     def insert(self, table: str, row: dict) -> int:

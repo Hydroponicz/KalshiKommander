@@ -13,6 +13,7 @@ class MarketConfig:
     series_ticker: str = ""         # legacy single-city setting; prefer [[cities]] or the Cities page
     city_label: str = ""
     timezone: str = "America/New_York"  # YOUR timezone: display + daily-loss day boundary
+    follow_all: bool = True             # automatically follow every Kalshi daily-high-temperature city
 
 
 @dataclass
@@ -71,6 +72,7 @@ class ReadinessConfig:
 class AutoConfig:
     update_every_minutes: int = 0    # while `serve` runs: update prices+forecasts every N minutes (0 = off)
     record_decisions: bool = True    # automatic updates also record a timestamped decision per contract
+    paper_trade: bool = False        # automatic updates also place every paper-buy signal (PAPER only)
 
 
 @dataclass

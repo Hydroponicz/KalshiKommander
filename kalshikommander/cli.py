@@ -66,6 +66,8 @@ def main(argv=None) -> int:
     up = sub.add_parser("update", help="one-shot: refresh prices, fetch automatic forecasts, record decisions")
     up.add_argument("--no-decisions", action="store_true", help="don't record decision snapshots")
     up.add_argument("--force", action="store_true", help="fetch forecasts even if fetched recently")
+    up.add_argument("--paper-trade", action="store_true", help="also simulate every paper-buy signal (PAPER only)")
+    sub.add_parser("follow-all", help="follow every Kalshi daily-high city now (timezone + location filled in)")
     lo = sub.add_parser("set-location", help="set the forecast location for a city")
     lo.add_argument("series")
     lo.add_argument("lat", type=float)
@@ -127,8 +129,11 @@ def _run(args, app, cfg) -> int:
             raise ValueError("--auto-update must be at least 5 minutes")
         serve(app, cfg.host, args.port or cfg.port, every)
     elif args.cmd == "update":
-        r = app.update(record_decisions=not args.no_decisions, force_forecasts=args.force)
+        r = app.update(record_decisions=not args.no_decisions, force_forecasts=args.force,
+                       paper_trade=(args.paper_trade or cfg.auto.paper_trade) and not args.no_decisions)
         print(json.dumps(r, indent=2, default=str))
+    elif args.cmd == "follow-all":
+        print(json.dumps(app.auto_follow(force=True), indent=2))
     elif args.cmd == "set-location":
         app.set_location(args.series.upper(), args.lat, args.lon)
         print(f"location saved for {args.series.upper()}")

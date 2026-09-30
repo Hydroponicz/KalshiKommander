@@ -8,6 +8,8 @@
 source = "sample"
 # YOUR timezone: used to display times and for the daily paper-loss limit.
 timezone = "America/New_York"
+# Follow every Kalshi daily-high-temperature city automatically (timezone + forecast location filled in).
+follow_all = true
 # Legacy single-city setting (still works). Prefer the dashboard's Cities page or [[cities]] below.
 series_ticker = ""
 city_label = ""
@@ -51,6 +53,9 @@ nws_user_agent = "KalshiKommander-research (your-email@example.com)"
 update_every_minutes = 0
 # Automatic updates also record a timestamped decision for every contract (no paper orders are placed).
 record_decisions = true
+# Also simulate every paper-buy signal automatically (PAPER only; never real money). Off = approve on the
+# Review & approve page. Approving everything, or turning this on, gives the least biased test.
+paper_trade = false
 
 [readiness]
 # Go/no-go targets for the Results page scorecard. Decide these BEFORE looking at results.

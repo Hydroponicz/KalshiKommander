@@ -74,6 +74,7 @@ class App:
         self.clock = clock
         self.http_opener = None  # injectable for tests; weather providers use urllib by default
         self.last_update = None  # (time, summary) of the most recent update()
+        self._last_follow = None
         p = cfg.paper
         self.executor = PaperExecutionAdapter(p.taker_fee_rate, p.slippage_per_contract,
                                               p.fill_fraction_of_displayed, p.max_quote_age_seconds)
@@ -108,8 +109,8 @@ class App:
             for r in self.store.all("SELECT * FROM tracked_series ORDER BY id"):
                 if r["action"] == "track":
                     out[r["series_ticker"]] = City(r["series_ticker"], r["label"] or "", r["timezone"],
-                                                   r["latitude"], r["longitude"], origin="dashboard")
-                elif out.get(r["series_ticker"]) and out[r["series_ticker"]].origin == "dashboard":
+                                                   r["latitude"], r["longitude"], origin=r["origin"] or "dashboard")
+                elif out.get(r["series_ticker"]) and out[r["series_ticker"]].origin in ("dashboard", "auto"):
                     out.pop(r["series_ticker"])
         return [self._with_location(c) for c in out.values()]
 
@@ -140,7 +141,7 @@ class App:
         return next((c for c in self.cities() if c.series_ticker == series_ticker), None)
 
     def track_city(self, series_ticker: str, label: str, timezone: str,
-                   latitude: float | None = None, longitude: float | None = None) -> int:
+                   latitude: float | None = None, longitude: float | None = None, origin: str = "dashboard") -> int:
         from zoneinfo import ZoneInfo
         series_ticker = series_ticker.strip().upper()
         if not re.fullmatch(r"[A-Z0-9_.-]+", series_ticker or ""):
@@ -148,15 +149,115 @@ class App:
         ZoneInfo(timezone)  # raises for unknown zones
         return self.store.insert("tracked_series", {
             "created_at": self.clock(), "action": "track", "series_ticker": series_ticker,
-            "label": label.strip(), "timezone": timezone, "latitude": latitude, "longitude": longitude})
+            "label": label.strip(), "timezone": timezone, "latitude": latitude, "longitude": longitude,
+            "origin": origin})
 
     def untrack_city(self, series_ticker: str) -> int:
         c = self.city(series_ticker)
-        if c is None or c.origin != "dashboard":
-            raise ValueError("only cities added on the Cities page can be removed there; "
+        if c is None or c.origin not in ("dashboard", "auto"):
+            raise ValueError("only cities added on the Cities page or followed automatically can be removed there; "
                              "edit config.toml for the others")
         return self.store.insert("tracked_series", {"created_at": self.clock(), "action": "untrack",
                                                     "series_ticker": series_ticker})
+
+    def auto_follow(self, force: bool = False) -> dict:
+        """Follow every daily-high-temperature series Kalshi lists (if `market.follow_all`), filling in
+        each city's timezone and forecast location automatically. Cities you stopped following stay
+        stopped. Runs at most every 6 hours unless forced."""
+        res = {"added": [], "needs_attention": [], "located": []}
+        if self.source.is_sample or (not self.cfg.market.follow_all and not force):
+            return res
+        now = self.clock()
+        if not force and self._last_follow and (now - self._last_follow).total_seconds() < 6 * 3600:
+            return res
+        from .weather.stations import resolve
+        stopped = {r["series_ticker"] for r in self.store.all("SELECT series_ticker FROM tracked_series WHERE action='untrack'")}
+        followed = {c.series_ticker: c for c in self.cities()}
+        ua = self.cfg.weather.nws_user_agent
+        for s in self.source.list_series():
+            t = (s.get("ticker") or "").upper()
+            if not t or not looks_like_daily_high_series(s) or t in stopped:
+                continue
+            if t in followed and followed[t].latitude is not None:
+                continue
+            rules = ""
+            try:  # the rules text often names the settlement station
+                evs = self.source.list_events(t)
+                ms = (evs[0].get("markets") or []) if evs else []
+                rules = (ms[0].get("rules_primary") or "") if ms else ""
+            except Exception:
+                pass
+            r = resolve(s, rules, ua, self.http_opener)
+            if t in followed:  # already followed but had no location
+                if r["lat"] is not None:
+                    self.set_location(t, r["lat"], r["lon"], r["note"])
+                    res["located"].append(followed[t].name)
+                continue
+            if not r["timezone"]:
+                res["needs_attention"].append(f"{r['label']} ({t}): couldn't work out its timezone — add it on the Cities page")
+                continue
+            self.track_city(t, r["label"], r["timezone"], origin="auto")
+            if r["lat"] is not None:
+                self.set_location(t, r["lat"], r["lon"], r["note"])
+            else:
+                res["needs_attention"].append(f"{r['label']} ({t}): no forecast location found — set it on the Cities page")
+            res["added"].append(r["label"])
+        self._last_follow = now
+        return res
+
+    def paper_buy_signals(self) -> list[dict]:
+        """Every current paper-buy signal across all followed cities (live check, nothing saved)."""
+        out = []
+        for t in self.todays_tickers():
+            a = self.analyze(t)
+            d = a["decision"]
+            if d.action == "NO_TRADE":
+                continue
+            s = next(x for x in d.sides if x.side == d.side)
+            city = self.city(a["contract"].series_ticker)
+            out.append({"ticker": t, "city": city.name if city else a["contract"].series_ticker,
+                        "contract": a["contract"], "side": d.side, "price": s.best_ask,
+                        "all_in": s.all_in_cost_per_contract, "prob": s.model_prob, "edge": s.edge,
+                        "qty": d.qty, "max_cost": d.max_cost, "p_yes": a["p_yes"],
+                        "book_at": a["book_row"]["captured_at"] if a["book_row"] else None})
+        return sorted(out, key=lambda x: -(x["edge"] or 0))
+
+    def approve_paper_buys(self, tickers: list[str], fresh_seconds: int = 120) -> list[dict]:
+        """For each ticker: make sure prices are fresh (re-snapshot the city if not), record a new
+        decision, and simulate the paper order only if it is STILL a paper-buy. PAPER only."""
+        now = self.clock()
+        stale = set()
+        for t in tickers:
+            c, _ = self.contract_at(t, now)
+            _, brow = self.book_at(t, now)
+            if c and (brow is None or (now - parse_ts(brow["captured_at"])).total_seconds() > fresh_seconds):
+                stale.add(c.series_ticker)
+        for series in stale:
+            self.refresh(series)
+        results = []
+        for t in tickers:
+            did = self.record_decision(t)
+            d = self.store.one("SELECT * FROM decisions WHERE id=?", (did,))
+            if d["action"] == "NO_TRADE":
+                results.append({"ticker": t, "status": "SKIPPED", "detail": "; ".join(json.loads(d["reasons_json"]))})
+                continue
+            try:
+                r = self.execute_paper(did)
+                results.append({"ticker": t, "status": r["status"], "qty": r["qty"], "cost": r["cost"],
+                                "side": d["side"], "detail": ""})
+            except ValueError as e:
+                results.append({"ticker": t, "status": "SKIPPED", "detail": str(e)})
+        return results
+
+    def accept_all_rules(self) -> dict:
+        """accept_city_rules for every followed city; wordings failing automatic checks are skipped."""
+        res = {"accepted": 0, "skipped": []}
+        for c in self.cities():
+            try:
+                res["accepted"] += self.accept_city_rules(c.series_ticker)
+            except ValueError as e:
+                res["skipped"].append(f"{c.name}: {e}")
+        return res
 
     def discover_cities(self) -> list[dict]:
         """Daily-high series currently listed by the market-data source, with a timezone GUESS."""
@@ -208,10 +309,12 @@ class App:
                 c = parse_contract(m, ev_meta, series, self.source.is_sample)
                 if c.target_date not in wanted:
                     continue
-                try:
-                    full = self.source.get_market(c.ticker) or m
-                except Exception as e:  # keep list data but note it
-                    full, _ = m, errors.append(f"{c.ticker}: market detail failed: {e}")
+                full = m
+                if not m.get("rules_primary"):  # nested event data usually has the full market already
+                    try:
+                        full = self.source.get_market(c.ticker) or m
+                    except Exception as e:  # keep list data but note it
+                        errors.append(f"{c.ticker}: market detail failed: {e}")
                 self.store.insert("market_snapshots", {
                     "captured_at": self.clock(), "source": self.source.name, "is_sample": int(self.source.is_sample),
                     "ticker": c.ticker, "event_ticker": c.event_ticker, "series_ticker": city.series_ticker,
@@ -244,13 +347,15 @@ class App:
         return parse_orderbook(json.loads(row["orderbook_json"])), row
 
     def known_tickers(self, as_of: datetime | None = None, dates: set[date] | None = None,
-                      series_ticker: str | None = None) -> list[str]:
+                      series_ticker: str | None = None, since_days: float | None = None) -> list[str]:
         as_of = as_of or self.clock()
+        since = to_iso(as_of - timedelta(days=since_days)) if since_days else ""
         if series_ticker:
-            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=? AND series_ticker=?",
-                                  (to_iso(as_of), series_ticker))
+            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=? AND captured_at>=? "
+                                  "AND series_ticker=?", (to_iso(as_of), since, series_ticker))
         else:
-            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=?", (to_iso(as_of),))
+            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=? AND captured_at>=?",
+                                  (to_iso(as_of), since))
         out = []
         for r in rows:
             c, _ = self.contract_at(r["ticker"], as_of)
@@ -265,7 +370,7 @@ class App:
         for city in self.cities():
             if series_ticker and city.series_ticker != series_ticker:
                 continue
-            out += self.known_tickers(dates=set(self.city_dates(city)), series_ticker=city.series_ticker)
+            out += self.known_tickers(dates=set(self.city_dates(city)), series_ticker=city.series_ticker, since_days=3)
         return out
 
     # ---------------------------------------------------------------- forecasts
@@ -384,18 +489,28 @@ class App:
             saved += 1
         return saved
 
-    def update(self, record_decisions: bool = False, force_forecasts: bool = False) -> dict:
+    def update(self, record_decisions: bool = False, force_forecasts: bool = False, paper_trade: bool = False) -> dict:
         """One-stop update: snapshot prices, fetch automatic forecasts, optionally record decisions."""
-        r = {"prices": self.refresh(), "forecasts": self.auto_forecasts(force_forecasts), "decisions": 0,
-             "settled": [], "settle_error": ""}
+        follow = {"added": [], "needs_attention": [], "located": []}
+        try:
+            follow = self.auto_follow()
+        except Exception as e:  # reported, other steps continue
+            follow["needs_attention"].append(f"automatic city discovery failed: {e}")
+        r = {"follow": follow, "prices": self.refresh(), "forecasts": self.auto_forecasts(force_forecasts),
+             "decisions": 0, "settled": [], "settle_error": "", "paper_trades": []}
         try:
             r["settled"] = self.fetch_settlements()
         except Exception as e:  # reported, never guessed
             r["settle_error"] = str(e)
         if record_decisions:
             for t in self.todays_tickers():
-                self.record_decision(t)
+                did = self.record_decision(t)
                 r["decisions"] += 1
+                if paper_trade and self.store.one("SELECT action FROM decisions WHERE id=?", (did,))["action"] != "NO_TRADE":
+                    try:
+                        r["paper_trades"].append({"ticker": t, **self.execute_paper(did)})
+                    except ValueError:
+                        pass
         self.last_update = (self.clock(), r)
         return r
 
@@ -616,7 +731,7 @@ class App:
         done = {r["ticker"] for r in self.store.all("SELECT ticker FROM settlements")}
         now = self.clock()
         recorded = []
-        for t in self.known_tickers():
+        for t in self.known_tickers(since_days=25):
             if t in done:
                 continue
             c, _ = self.contract_at(t, now)
