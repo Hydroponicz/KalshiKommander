@@ -138,6 +138,21 @@ class Contract:
             return f"reported high ≥ {ks[0]}{u}"
         return f"reported high from {ks[0]}{u} to {ks[-1]}{u} (inclusive)"
 
+    def outcome_label(self) -> str:
+        """Short plain-English outcome, e.g. '75°F or above', '69–70°F', '68°F or below'."""
+        try:
+            ks = [k for k in range(-60, 141) if self.yes_if(k)]
+        except ValueError:
+            return "unrecognized terms"
+        u = f"°{self.unit}"
+        if not ks or (ks[0] == -60 and ks[-1] == 140):
+            return "unrecognized terms"
+        if ks[0] == -60:
+            return f"{ks[-1]}{u} or below"
+        if ks[-1] == 140:
+            return f"{ks[0]}{u} or above"
+        return f"{ks[0]}{u}" if ks[0] == ks[-1] else f"{ks[0]}–{ks[-1]}{u}"
+
     def threshold_text(self) -> str:
         lo, hi = self.floor_strike, self.cap_strike
         return f"strike_type={self.strike_type}, floor_strike={lo}, cap_strike={hi} (°{self.unit})"

@@ -10,9 +10,18 @@ from pathlib import Path
 @dataclass
 class MarketConfig:
     source: str = "sample"          # "sample" (clearly labeled fake data) or "kalshi_public"
-    series_ticker: str = ""         # choose with `python -m kalshikommander discover`
+    series_ticker: str = ""         # legacy single-city setting; prefer [[cities]] or the Cities page
     city_label: str = ""
-    timezone: str = "America/New_York"
+    timezone: str = "America/New_York"  # YOUR timezone: display + daily-loss day boundary
+
+
+@dataclass
+class CityConfig:
+    series_ticker: str
+    label: str = ""
+    timezone: str = "America/New_York"  # the city's own IANA timezone
+    latitude: float | None = None       # optional, for the NWS forecast helper
+    longitude: float | None = None
 
 
 @dataclass
@@ -51,6 +60,7 @@ class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    cities: list = field(default_factory=list)  # list[CityConfig]
     data_dir: str = "data"
     host: str = "127.0.0.1"
     port: int = 8765
@@ -78,6 +88,14 @@ def _apply(dc, data: dict, section: str):
         setattr(dc, k, v)
 
 
+def _check_tz(name: str):
+    from zoneinfo import ZoneInfo
+    try:
+        ZoneInfo(name)
+    except Exception as e:
+        raise ValueError(f"unknown timezone {name!r} (use an IANA name like America/Chicago)") from e
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     cfg = AppConfig()
     if path is None:
@@ -88,7 +106,15 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     for section in ("market", "model", "paper", "weather"):
         if section in data:
             _apply(getattr(cfg, section), data.pop(section), section)
+    for i, c in enumerate(data.pop("cities", []) or []):
+        city = CityConfig(series_ticker="")
+        _apply(city, c, f"cities[{i}]")
+        if not city.series_ticker:
+            raise ValueError(f"cities[{i}] needs series_ticker")
+        _check_tz(city.timezone)
+        cfg.cities.append(city)
     _apply(cfg, data, "top-level")
+    _check_tz(cfg.market.timezone)
     if cfg.market.source not in ("sample", "kalshi_public"):
         raise ValueError("market.source must be 'sample' or 'kalshi_public'")
     if cfg.host not in ("127.0.0.1", "localhost", "::1"):

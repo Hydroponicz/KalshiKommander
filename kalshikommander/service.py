@@ -7,19 +7,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from typing import Callable
 
 from . import PAPER_LABEL
+from .cities import City, guess_label, guess_timezone
 from .config import AppConfig
 from .contracts import Contract, parse_contract
 from .decision import ForecastInput, decide
 from .execution.base import OrderRequest
 from .execution.paper import PaperExecutionAdapter
-from .marketdata.base import MarketDataSource
+from .marketdata.base import MarketDataSource, looks_like_daily_high_series
 from .marketdata.kalshi_public import KalshiPublicClient
-from .marketdata.sample import SampleSource
+from .marketdata.sample import SAMPLE_CITIES, SampleSource
 from .orderbook import OrderBook, parse_orderbook
 from .probability import METHOD, p_yes, sensitivity
 from .risk import RiskState
@@ -57,22 +59,100 @@ class App:
 
     @property
     def tz(self) -> str:
+        """YOUR timezone (display and the daily-loss day boundary)."""
         return self.cfg.market.timezone
 
+    # ---------------------------------------------------------------- cities
     @property
-    def series_ticker(self) -> str:
+    def legacy_series(self) -> str:
+        """The single series from the pre-multi-city `[market] series_ticker` setting (if any)."""
         return self.cfg.market.series_ticker or ("SAMPLE-HIGHTEMP" if self.source.is_sample else "")
 
+    def cities(self) -> list[City]:
+        """Tracked cities: config `[[cities]]`, the legacy `[market]` series, then dashboard choices."""
+        out: dict[str, City] = {}
+        if self.source.is_sample:
+            for t, (label, tz, _) in SAMPLE_CITIES.items():
+                out[t] = City(t, f"{label} (SAMPLE)", tz, origin="sample")
+        elif self.cfg.market.series_ticker:
+            m = self.cfg.market
+            out[m.series_ticker] = City(m.series_ticker, m.city_label, m.timezone,
+                                        self.cfg.weather.latitude, self.cfg.weather.longitude)
+        for c in self.cfg.cities:
+            out[c.series_ticker] = City(c.series_ticker, c.label, c.timezone, c.latitude, c.longitude)
+        if not self.source.is_sample:
+            for r in self.store.all("SELECT * FROM tracked_series ORDER BY id"):
+                if r["action"] == "track":
+                    out[r["series_ticker"]] = City(r["series_ticker"], r["label"] or "", r["timezone"],
+                                                   r["latitude"], r["longitude"], origin="dashboard")
+                elif out.get(r["series_ticker"]) and out[r["series_ticker"]].origin == "dashboard":
+                    out.pop(r["series_ticker"])
+        return list(out.values())
+
+    def city(self, series_ticker: str) -> City | None:
+        return next((c for c in self.cities() if c.series_ticker == series_ticker), None)
+
+    def track_city(self, series_ticker: str, label: str, timezone: str,
+                   latitude: float | None = None, longitude: float | None = None) -> int:
+        from zoneinfo import ZoneInfo
+        series_ticker = series_ticker.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_.-]+", series_ticker or ""):
+            raise ValueError("invalid series ticker")
+        ZoneInfo(timezone)  # raises for unknown zones
+        return self.store.insert("tracked_series", {
+            "created_at": self.clock(), "action": "track", "series_ticker": series_ticker,
+            "label": label.strip(), "timezone": timezone, "latitude": latitude, "longitude": longitude})
+
+    def untrack_city(self, series_ticker: str) -> int:
+        c = self.city(series_ticker)
+        if c is None or c.origin != "dashboard":
+            raise ValueError("only cities added on the Cities page can be removed there; "
+                             "edit config.toml for the others")
+        return self.store.insert("tracked_series", {"created_at": self.clock(), "action": "untrack",
+                                                    "series_ticker": series_ticker})
+
+    def discover_cities(self) -> list[dict]:
+        """Daily-high series currently listed by the market-data source, with a timezone GUESS."""
+        tracked = {c.series_ticker for c in self.cities()}
+        out = []
+        for s in self.source.list_series():
+            if not looks_like_daily_high_series(s):
+                continue
+            title = s.get("title") or ""
+            out.append({"ticker": s.get("ticker", ""), "title": title,
+                        "label": guess_label(title, s.get("ticker", "")),
+                        "tz_guess": guess_timezone(title + " " + s.get("ticker", "")),
+                        "sources": ", ".join(x.get("name", "") for x in s.get("settlement_sources") or []),
+                        "tracked": s.get("ticker") in tracked})
+        return sorted(out, key=lambda x: x["label"].lower())
+
+    def city_dates(self, city: City) -> list[date]:
+        today = local_date(self.clock(), city.timezone)
+        return [today, today + timedelta(days=1)]
+
     # ---------------------------------------------------------------- market data snapshots
-    def refresh(self) -> dict:
-        """Snapshot every open market (and its book) in the series for today/tomorrow (local)."""
-        if not self.series_ticker:
-            raise RuntimeError("No series configured. Run `python -m kalshikommander discover` and set "
-                               "market.series_ticker in config.toml.")
-        series = self.source.get_series(self.series_ticker)
-        events = self.source.list_events(self.series_ticker)
-        today = local_date(self.clock(), self.tz)
-        wanted = {today, today + timedelta(days=1)}
+    def refresh(self, series_ticker: str | None = None) -> dict:
+        """Snapshot every open market (and its book) for today/tomorrow in each city's own timezone."""
+        cities = self.cities() if series_ticker is None else [c for c in self.cities() if c.series_ticker == series_ticker]
+        if not cities:
+            raise RuntimeError("No cities tracked. Open the Cities page (or run `python -m kalshikommander discover`) "
+                               "and add one.")
+        total = {"markets": 0, "orderbooks": 0, "errors": []}
+        for city in cities:
+            try:
+                r = self._refresh_city(city)
+            except Exception as e:
+                total["errors"].append(f"{city.name}: {e}")
+                continue
+            total["markets"] += r["markets"]
+            total["orderbooks"] += r["orderbooks"]
+            total["errors"] += r["errors"]
+        return total
+
+    def _refresh_city(self, city: City) -> dict:
+        series = self.source.get_series(city.series_ticker)
+        events = self.source.list_events(city.series_ticker)
+        wanted = set(self.city_dates(city))
         n_m = n_b = 0
         errors = []
         for ev in events:
@@ -87,7 +167,7 @@ class App:
                     full, _ = m, errors.append(f"{c.ticker}: market detail failed: {e}")
                 self.store.insert("market_snapshots", {
                     "captured_at": self.clock(), "source": self.source.name, "is_sample": int(self.source.is_sample),
-                    "ticker": c.ticker, "event_ticker": c.event_ticker, "series_ticker": self.series_ticker,
+                    "ticker": c.ticker, "event_ticker": c.event_ticker, "series_ticker": city.series_ticker,
                     "market_json": full, "event_json": ev_meta, "series_json": series})
                 n_m += 1
                 try:
@@ -106,6 +186,8 @@ class App:
             return None, None
         c = parse_contract(json.loads(row["market_json"]), json.loads(row["event_json"] or "{}"),
                            json.loads(row["series_json"] or "{}"), bool(row["is_sample"]))
+        if row["series_ticker"]:
+            c.series_ticker = row["series_ticker"]
         return c, row
 
     def book_at(self, ticker: str, as_of: datetime) -> tuple[OrderBook | None, object]:
@@ -114,27 +196,41 @@ class App:
             return None, None
         return parse_orderbook(json.loads(row["orderbook_json"])), row
 
-    def known_tickers(self, as_of: datetime | None = None, dates: set[date] | None = None) -> list[str]:
+    def known_tickers(self, as_of: datetime | None = None, dates: set[date] | None = None,
+                      series_ticker: str | None = None) -> list[str]:
         as_of = as_of or self.clock()
-        rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=? ORDER BY ticker",
-                              (to_iso(as_of),))
+        if series_ticker:
+            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=? AND series_ticker=?",
+                                  (to_iso(as_of), series_ticker))
+        else:
+            rows = self.store.all("SELECT DISTINCT ticker FROM market_snapshots WHERE captured_at<=?", (to_iso(as_of),))
         out = []
         for r in rows:
             c, _ = self.contract_at(r["ticker"], as_of)
             if c and (dates is None or c.target_date in dates):
-                out.append((c.target_date or date.min, c.floor_strike if c.floor_strike is not None else -1e9, r["ticker"]))
+                lo = c.floor_strike if c.floor_strike is not None else (c.cap_strike or 0) - 1e6
+                out.append((c.target_date or date.min, lo, r["ticker"]))
         return [t for *_, t in sorted(out)]
 
-    def todays_tickers(self) -> list[str]:
-        today = local_date(self.clock(), self.tz)
-        return self.known_tickers(dates={today, today + timedelta(days=1)})
+    def todays_tickers(self, series_ticker: str | None = None) -> list[str]:
+        """Contracts for today/tomorrow, where 'today' is each city's own local date."""
+        out = []
+        for city in self.cities():
+            if series_ticker and city.series_ticker != series_ticker:
+                continue
+            out += self.known_tickers(dates=set(self.city_dates(city)), series_ticker=city.series_ticker)
+        return out
 
     # ---------------------------------------------------------------- forecasts
     def add_forecast(self, *, target_date: date, expected_high: float, unit: str, sigma: float | None,
-                     issued_at: datetime, source: str, source_detail: str = "", location: str = "",
-                     notes: str = "", raw: dict | None = None) -> int:
+                     issued_at: datetime, source: str, series_ticker: str | None = None, source_detail: str = "",
+                     location: str = "", notes: str = "", raw: dict | None = None) -> int:
         now = self.clock()
         unit = normalize_unit(unit)
+        series_ticker = series_ticker or self.legacy_series
+        city = self.city(series_ticker) if series_ticker else None
+        if city is None:
+            raise ValueError("choose which tracked city this forecast is for")
         if not source.strip():
             raise ValueError("forecast source is required")
         if issued_at > now:
@@ -148,27 +244,34 @@ class App:
             raise ValueError("uncertainty (sigma) must be > 0")
         return self.store.insert("forecasts", {
             "recorded_at": now, "issued_at": issued_at, "target_date": target_date.isoformat(),
-            "location": location or self.cfg.market.city_label, "source": source.strip(),
+            "series_ticker": city.series_ticker, "location": location or city.name, "source": source.strip(),
             "source_detail": source_detail, "expected_high": expected_high, "unit": unit,
             "expected_high_f": round(to_f(expected_high, unit), 3), "sigma": sigma,
             "sigma_f": round(spread_to_f(sigma, unit_sigma), 3), "sigma_is_assumption": int(sigma_is_assumption),
             "notes": notes, "raw_json": raw or {}})
 
-    def fetch_nws(self, target: date) -> int:
+    def fetch_nws(self, target: date, series_ticker: str | None = None) -> int:
         from .weather.nws import fetch_nws_forecast
+        series_ticker = series_ticker or self.legacy_series
+        city = self.city(series_ticker)
+        if city is None:
+            raise ValueError("unknown city")
         w = self.cfg.weather
-        if w.latitude is None or w.longitude is None:
-            raise RuntimeError("Set weather.latitude and weather.longitude in config.toml to use NWS")
-        parsed, raw = fetch_nws_forecast(w.latitude, w.longitude, target, w.nws_user_agent)
+        lat = city.latitude if city.latitude is not None else w.latitude
+        lon = city.longitude if city.longitude is not None else w.longitude
+        if lat is None or lon is None:
+            raise RuntimeError(f"Set a latitude/longitude for {city.name} (Cities page or config.toml) to use NWS")
+        parsed, raw = fetch_nws_forecast(lat, lon, target, w.nws_user_agent)
         if parsed is None:
             raise RuntimeError(f"NWS forecast had no daytime period for {target}; nothing recorded")
         return self.add_forecast(target_date=target, expected_high=parsed["expected_high"], unit=parsed["unit"],
                                  sigma=None, issued_at=parsed["issued_at"], source="NWS api.weather.gov",
+                                 series_ticker=city.series_ticker,
                                  source_detail=f"{raw['forecast_url']} period={parsed['period_name']}",
                                  notes=parsed["detail"], raw={"forecast_url": raw["forecast_url"]})
 
-    def forecast_at(self, target: date, as_of: datetime):
-        return self.store.latest_forecast(target.isoformat(), as_of)
+    def forecast_at(self, series_ticker: str, target: date, as_of: datetime):
+        return self.store.latest_forecast(series_ticker, target.isoformat(), as_of, self.legacy_series)
 
     # ---------------------------------------------------------------- terms acknowledgment
     def ack_terms(self, ticker: str) -> int:
@@ -226,7 +329,7 @@ class App:
         now = as_of or self.clock()
         c, mrow = self.contract_at(ticker, now)
         book, brow = self.book_at(ticker, now)
-        frow = self.forecast_at(c.target_date, now) if c and c.target_date else None
+        frow = self.forecast_at(c.series_ticker, c.target_date, now) if c and c.target_date else None
         fin = None
         prob = sens = None
         sig = None
@@ -277,7 +380,7 @@ class App:
             "action": dec.action, "side": dec.side, "qty": dec.qty, "limit_price": dec.limit_price,
             "max_cost": dec.max_cost, "p_yes": a["p_yes"], "market_mid_yes": self._mid(a["book"]),
             "reasons_json": dec.reasons,
-            "detail_json": {"sides": [asdict(s) for s in dec.sides], "risk_notes": dec.risk_notes,
+            "detail_json": {"sides": [asdict(s) for s in dec.sides], "risk_notes": dec.risk_notes, "codes": dec.codes,
                             "terms_acked": a["acked"], "label": PAPER_LABEL},
             "config_json": asdict(self.cfg.paper)})
 

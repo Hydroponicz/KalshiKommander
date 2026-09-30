@@ -6,11 +6,11 @@
 # "sample"        -> clearly labeled fictional data (works offline; separate data/sample.db)
 # "kalshi_public" -> Kalshi's public, unauthenticated market-data API (data/kalshi_public.db)
 source = "sample"
-# Run `python -m kalshikommander discover --check-open` and paste a series ticker here.
+# YOUR timezone: used to display times and for the daily paper-loss limit.
+timezone = "America/New_York"
+# Legacy single-city setting (still works). Prefer the dashboard's Cities page or [[cities]] below.
 series_ticker = ""
 city_label = ""
-# IANA timezone of the city whose weather settles the market (used for local dates/display).
-timezone = "America/New_York"
 
 [model]
 # ASSUMPTION, not calibrated: std. dev. (°F) of (reported high - forecast high).
@@ -30,6 +30,15 @@ max_stake_per_market = 25.0
 max_total_exposure = 100.0
 max_daily_loss = 50.0
 require_terms_ack = true
+
+# Cities to follow (optional; you can also add them on the dashboard's Cities page).
+# Each city's timezone decides what "today" means for its markets.
+# [[cities]]
+# series_ticker = "KXHIGHCHI"
+# label = "Chicago"
+# timezone = "America/Chicago"
+# latitude = 41.79      # optional, for the NWS forecast helper
+# longitude = -87.75
 
 [weather]
 provider = "manual"            # or "nws" to enable the optional api.weather.gov button (US only)

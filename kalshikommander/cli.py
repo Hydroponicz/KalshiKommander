@@ -37,7 +37,8 @@ def cmd_discover(args, cfg):
                 n_open = f"error: {e}"
         srcs = ", ".join(x.get("name", "") for x in s.get("settlement_sources") or [])
         print(f"{s.get('ticker'):<16} open events: {n_open!s:<4} {s.get('title')}  [settles: {srcs or 'n/a'}]")
-    print("\nSet [market] series_ticker (and timezone, city_label) in config.toml, with source = \"kalshi_public\".")
+    print("\nTo follow cities: set source = \"kalshi_public\" in config.toml, then use the dashboard's Cities page,\n"
+          "`python -m kalshikommander track <SERIES> --timezone America/Chicago --label Chicago`, or [[cities]] in config.toml.")
     return 0
 
 
@@ -47,10 +48,21 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("discover", help="list available daily-high-temperature series (public data)")
     d.add_argument("--check-open", action="store_true", help="also count open events per series")
-    sub.add_parser("refresh", help="snapshot today's/tomorrow's markets and order books")
+    rf = sub.add_parser("refresh", help="snapshot today's/tomorrow's markets and order books")
+    rf.add_argument("--city", help="series ticker (default: all tracked cities)")
+    sub.add_parser("cities", help="list tracked cities")
+    tr = sub.add_parser("track", help="follow a city's daily-high series")
+    tr.add_argument("series")
+    tr.add_argument("--timezone", required=True, help="the city's IANA timezone, e.g. America/Chicago")
+    tr.add_argument("--label", default="")
+    tr.add_argument("--lat", type=float)
+    tr.add_argument("--lon", type=float)
+    ut = sub.add_parser("untrack", help="stop following a city added with `track` or the dashboard")
+    ut.add_argument("series")
     s = sub.add_parser("serve", help="run the local dashboard")
     s.add_argument("--port", type=int)
     f = sub.add_parser("add-forecast", help="record a manually sourced forecast")
+    f.add_argument("--city", help="series ticker (required when following more than one city)")
     f.add_argument("--date", required=True)
     f.add_argument("--high", type=float, required=True)
     f.add_argument("--unit", default="F")
@@ -60,6 +72,7 @@ def main(argv=None) -> int:
     f.add_argument("--detail", default="")
     n = sub.add_parser("nws", help="fetch an NWS forecast (optional provider)")
     n.add_argument("--date", required=True)
+    n.add_argument("--city", help="series ticker")
     dc = sub.add_parser("decide", help="record timestamped decision snapshots")
     dc.add_argument("--ticker", action="append", help="default: all of today's/tomorrow's contracts")
     ex = sub.add_parser("paper-execute", help="simulate a stored BUY decision")
@@ -87,17 +100,26 @@ def main(argv=None) -> int:
 
 def _run(args, app, cfg) -> int:
     if args.cmd == "refresh":
-        print(json.dumps(app.refresh(), indent=2))
+        print(json.dumps(app.refresh(args.city), indent=2))
+    elif args.cmd == "cities":
+        for c in app.cities():
+            print(f"{c.series_ticker:<18} {c.name:<22} {c.timezone:<22} ({c.origin})")
+    elif args.cmd == "track":
+        app.track_city(args.series, args.label, args.timezone, args.lat, args.lon)
+        print(f"following {args.series}")
+    elif args.cmd == "untrack":
+        app.untrack_city(args.series)
+        print(f"stopped following {args.series}")
     elif args.cmd == "serve":
         from .web import serve
         serve(app, cfg.host, args.port or cfg.port)
     elif args.cmd == "add-forecast":
         fid = app.add_forecast(target_date=date.fromisoformat(args.date), expected_high=args.high, unit=args.unit,
                                sigma=args.sigma, issued_at=parse_local_input(args.issued, app.tz),
-                               source=args.source, source_detail=args.detail)
+                               source=args.source, series_ticker=_city_arg(app, args.city), source_detail=args.detail)
         print(f"forecast #{fid} saved")
     elif args.cmd == "nws":
-        print(f"forecast #{app.fetch_nws(date.fromisoformat(args.date))} saved")
+        print(f"forecast #{app.fetch_nws(date.fromisoformat(args.date), _city_arg(app, args.city))} saved")
     elif args.cmd == "decide":
         for t in args.ticker or app.todays_tickers():
             did = app.record_decision(t)
@@ -116,6 +138,15 @@ def _run(args, app, cfg) -> int:
     elif args.cmd == "status":
         print(json.dumps(app.performance(), indent=2))
     return 0
+
+
+def _city_arg(app, city: str | None) -> str | None:
+    if city:
+        return city.upper()
+    cities = app.cities()
+    if len(cities) == 1:
+        return cities[0].series_ticker
+    raise ValueError("more than one city is tracked; pass --city SERIES (see `cities`)")
 
 
 if __name__ == "__main__":

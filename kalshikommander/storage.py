@@ -16,7 +16,7 @@ from .timeutil import to_iso
 
 APPEND_ONLY_TABLES = [
     "market_snapshots", "orderbook_snapshots", "forecasts", "estimates", "decisions",
-    "paper_orders", "paper_fills", "cash_ledger", "settlements", "terms_acks",
+    "paper_orders", "paper_fills", "cash_ledger", "settlements", "terms_acks", "tracked_series",
 ]
 
 SCHEMA = """
@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS settlements (
   id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, ticker TEXT NOT NULL UNIQUE,
   result TEXT NOT NULL CHECK (result IN ('yes','no')), source TEXT NOT NULL,
   observed_high REAL, notes TEXT, raw_json TEXT);
+CREATE TABLE IF NOT EXISTS tracked_series (
+  id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, action TEXT NOT NULL CHECK (action IN ('track','untrack')),
+  series_ticker TEXT NOT NULL, label TEXT, timezone TEXT, latitude REAL, longitude REAL);
 CREATE TABLE IF NOT EXISTS terms_acks (
   id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, ticker TEXT NOT NULL,
   market_snapshot_id INTEGER NOT NULL REFERENCES market_snapshots(id), rules_sha TEXT NOT NULL);
@@ -88,8 +91,17 @@ class Store:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.executescript(SCHEMA + _triggers())
+        self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.executescript(_triggers())
         self.conn.commit()
+
+    def _migrate(self):
+        """Additive migrations only (ALTER TABLE ADD COLUMN); existing rows are never rewritten."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(forecasts)")}
+        if "series_ticker" not in cols:
+            # NULL on pre-existing rows = forecast recorded before multi-city support
+            self.conn.execute("ALTER TABLE forecasts ADD COLUMN series_ticker TEXT")
 
     # -- generic -------------------------------------------------------------------------
     def insert(self, table: str, row: dict) -> int:
@@ -119,11 +131,15 @@ class Store:
         return self.one("SELECT * FROM orderbook_snapshots WHERE ticker=? AND captured_at<=? "
                         "ORDER BY captured_at DESC, id DESC LIMIT 1", (ticker, to_iso(as_of)))
 
-    def latest_forecast(self, target_date: str, as_of: datetime):
-        """Most recently ISSUED forecast for the date that was both issued and recorded by as_of."""
+    def latest_forecast(self, series_ticker: str, target_date: str, as_of: datetime, legacy_series: str = ""):
+        """Most recently ISSUED forecast for this city+date that was both issued and recorded by as_of.
+
+        Rows from before multi-city support have series_ticker NULL; they belong to `legacy_series`
+        (the single series that was configured then)."""
         return self.one("SELECT * FROM forecasts WHERE target_date=? AND issued_at<=? AND recorded_at<=? "
+                        "AND (series_ticker=? OR (series_ticker IS NULL AND ?=?)) "
                         "ORDER BY issued_at DESC, id DESC LIMIT 1",
-                        (target_date, to_iso(as_of), to_iso(as_of)))
+                        (target_date, to_iso(as_of), to_iso(as_of), series_ticker, series_ticker, legacy_series))
 
     def terms_acked(self, ticker: str, rules_sha: str, as_of: datetime) -> bool:
         return self.one("SELECT 1 FROM terms_acks WHERE ticker=? AND rules_sha=? AND created_at<=?",

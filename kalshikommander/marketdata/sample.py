@@ -12,6 +12,12 @@ from zoneinfo import ZoneInfo
 from .base import MarketDataSource
 
 SAMPLE_SERIES = "SAMPLE-HIGHTEMP"
+SAMPLE_SERIES_2 = "SAMPLE-HIGHTEMP2"
+# series -> (fictional city, timezone, base temperature)
+SAMPLE_CITIES = {
+    SAMPLE_SERIES: ("Sampleville", "America/New_York", 72),
+    SAMPLE_SERIES_2: ("Testburg", "America/Chicago", 64),
+}
 SAMPLE_NOTE = "SAMPLE DATA - fictional market for testing the app; not from Kalshi"
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
@@ -25,24 +31,25 @@ class SampleSource(MarketDataSource):
     is_sample = True
 
     def __init__(self, tz_name: str = "America/New_York", today: date | None = None):
-        self.tz = ZoneInfo(tz_name)
-        self.today = today or datetime.now(self.tz).date()
+        self.today = today or datetime.now(ZoneInfo(tz_name)).date()
 
     def list_series(self) -> list[dict]:
-        return [self.get_series(SAMPLE_SERIES)]
+        return [self.get_series(t) for t in SAMPLE_CITIES]
 
     def get_series(self, series_ticker: str) -> dict:
-        return {"ticker": SAMPLE_SERIES, "title": "SAMPLE: Highest temperature in Sampleville",
+        city = SAMPLE_CITIES[series_ticker][0]
+        return {"ticker": series_ticker, "title": f"SAMPLE: Highest temperature in {city}",
                 "frequency": "daily", "category": "SAMPLE",
                 "settlement_sources": [{"name": "SAMPLE Weather Service (fictional)", "url": ""}],
                 "contract_url": "", "fee_type": "quadratic", "fee_multiplier": 1, "_sample": SAMPLE_NOTE}
 
-    def _markets(self, d: date) -> list[dict]:
-        et = f"{SAMPLE_SERIES}-{_code(d)}"
-        close = datetime.combine(d + timedelta(days=1), time(0, 59), self.tz).isoformat()
-        opened = datetime.combine(d - timedelta(days=1), time(10, 0), self.tz).isoformat()
+    def _markets(self, d: date, series: str = SAMPLE_SERIES) -> list[dict]:
+        city, tz_name, base = SAMPLE_CITIES[series]
+        tz = ZoneInfo(tz_name)
+        et = f"{series}-{_code(d)}"
+        close = datetime.combine(d + timedelta(days=1), time(0, 59), tz).isoformat()
+        opened = datetime.combine(d - timedelta(days=1), time(10, 0), tz).isoformat()
         datestr = f"{d.strftime('%B')} {d.day}, {d.year}"
-        base = 72
         specs = [("less", None, base - 3), ("between", base - 3, base - 2), ("between", base - 1, base),
                  ("between", base + 1, base + 2), ("greater", base + 2, None)]
         # fictional bids: [yes_bids], [no_bids] in dollars
@@ -60,11 +67,11 @@ class SampleSource(MarketDataSource):
             tick = f"{et}-{'T' if st != 'between' else 'B'}{lo if lo is not None else hi}"
             out.append({
                 "ticker": tick, "event_ticker": et, "status": "active",
-                "title": f"SAMPLE: Highest temperature in Sampleville on {datestr}?",
+                "title": f"SAMPLE: Highest temperature in {city} on {datestr}?",
                 "yes_sub_title": sub, "open_time": opened, "close_time": close,
                 "expiration_time": close, "strike_type": st, "floor_strike": lo, "cap_strike": hi,
                 "rules_primary": (f"[SAMPLE DATA] If the highest temperature recorded at the fictional "
-                                  f"Sampleville station for {datestr} as reported by the SAMPLE Weather "
+                                  f"{city} station for {datestr} as reported by the SAMPLE Weather "
                                   f"Service is {cond}, then the market resolves to Yes."),
                 "rules_secondary": "[SAMPLE DATA] Fictional. Not a Kalshi contract.",
                 "yes_bid_dollars": f"{yb[0][0]:.4f}", "yes_ask_dollars": f"{1 - nb[0][0]:.4f}",
@@ -80,16 +87,17 @@ class SampleSource(MarketDataSource):
     def list_events(self, series_ticker: str) -> list[dict]:
         evs = []
         for d in (self.today, self.today + timedelta(days=1)):
-            ms = self._markets(d)
-            evs.append({"event_ticker": ms[0]["event_ticker"], "series_ticker": SAMPLE_SERIES,
+            ms = self._markets(d, series_ticker)
+            evs.append({"event_ticker": ms[0]["event_ticker"], "series_ticker": series_ticker,
                         "title": ms[0]["title"], "markets": [{k: v for k, v in m.items() if k != "_book"} for m in ms]})
         return evs
 
     def _find(self, ticker: str) -> dict:
-        for d in (self.today, self.today + timedelta(days=1)):
-            for m in self._markets(d):
-                if m["ticker"] == ticker:
-                    return m
+        for series in SAMPLE_CITIES:
+            for d in (self.today, self.today + timedelta(days=1)):
+                for m in self._markets(d, series):
+                    if m["ticker"] == ticker:
+                        return m
         raise KeyError(ticker)
 
     def get_market(self, ticker: str) -> dict:

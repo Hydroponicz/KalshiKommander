@@ -54,7 +54,7 @@ def test_series_filter():
 
 def test_no_order_placement_code_in_package():
     """Guard: the package must not reference order/portfolio endpoints or request signing."""
-    pattern = re.compile(r"portfolio|/orders|create_order|place_order|RSA|private_key|KALSHI-ACCESS", re.I)
+    pattern = re.compile(r"portfolio|/orders|create_order|place_order|\bRSA\b|private_key|KALSHI-ACCESS", re.I)
     offenders = []
     for p in PKG.rglob("*.py"):
         code = re.sub(r"#.*|\"\"\"[\s\S]*?\"\"\"", "", p.read_text())

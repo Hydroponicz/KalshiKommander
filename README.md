@@ -41,23 +41,42 @@ python -m kalshikommander serve
 
 `requirements.txt` holds only `tzdata`, which supplies the timezone database `zoneinfo` needs on Windows. Everything else uses the standard library.
 
+### Following several cities
+
+Each city is one Kalshi daily-high-temperature series. Prices, forecasts, decisions and rule confirmations are all kept per city. There are three ways to add cities; use whichever you like, and they can be mixed:
+
+1. **In the dashboard (easiest).** Go to the **Cities** page. It lists every daily-high series Kalshi offers right now. Check the pre-filled timezone (it's a *guess* from the city name, so confirm it) and click **Follow**. **Stop following** removes a city but keeps its saved history.
+2. **From the command line:** `python -m kalshikommander track KXHIGHCHI --timezone America/Chicago --label Chicago`. `python -m kalshikommander cities` lists what you follow.
+3. **In `config.toml`**, one block per city:
+
+   ```toml
+   [[cities]]
+   series_ticker = "KXHIGHCHI"
+   label = "Chicago"
+   timezone = "America/Chicago"   # the city's timezone: decides what "today" means for its markets
+   # latitude = 41.79             # optional, only for the NWS forecast button
+   # longitude = -87.75
+   ```
+
+The older single-city `[market] series_ticker` setting still works and shows up as one city. Forecasts saved before multi-city support stay attached to that city.
+
+On the command line, pass `--city SERIES` to `add-forecast`, `nws` and `refresh` when you follow more than one city.
+
 ### Switching to real Kalshi public data
 
 ```bash
 python -m kalshikommander discover --check-open   # lists daily-high-temperature series that exist now
 ```
 
-Edit `config.toml` with the series you picked:
+In `config.toml` set:
 
 ```toml
 [market]
 source = "kalshi_public"
-series_ticker = "<a ticker printed by discover>"
-city_label = "<city>"
-timezone = "<IANA zone of that city, e.g. America/Chicago>"
+timezone = "<YOUR timezone, e.g. America/New_York>"   # used for display and the daily paper-loss limit
 ```
 
-Then run `python -m kalshikommander serve` and click **Refresh market data**.
+Then run `python -m kalshikommander serve`, add cities on the **Cities** page (see above), and click **Refresh prices** on the Today page.
 
 Sample data and real data use separate databases: `data/sample.db` and `data/kalshi_public.db`. They never mix.
 
@@ -66,16 +85,30 @@ Sample data and real data use separate databases: `data/sample.db` and `data/kal
 | Command | What it does |
 |---|---|
 | `discover [--check-open]` | Find current daily-high-temperature series (public API). |
-| `refresh` | Snapshot today's and tomorrow's markets and order books. |
+| `refresh [--city SERIES]` | Snapshot today's and tomorrow's markets and order books (each city's own local dates). |
+| `cities` / `track SERIES --timezone TZ [--label NAME]` / `untrack SERIES` | List, follow or stop following cities. |
 | `serve [--port N]` | Run the dashboard, bound to 127.0.0.1 only. |
-| `add-forecast --date 2026-10-01 --high 74 --unit F [--sigma 3] --issued 2026-09-30T16:00 --source "NWS forecast page" [--detail URL]` | Record a forecast. |
-| `nws --date YYYY-MM-DD` | Optional: record an NWS gridpoint forecast. Needs `provider="nws"` and a latitude/longitude. |
+| `add-forecast [--city SERIES] --date 2026-10-01 --high 74 --unit F [--sigma 3] --issued 2026-09-30T16:00 --source "NWS forecast page" [--detail URL]` | Record a forecast. |
+| `nws [--city SERIES] --date YYYY-MM-DD` | Optional: record an NWS gridpoint forecast. Needs `provider="nws"` and a latitude/longitude. |
 | `decide [--ticker T ...]` | Record timestamped estimate and decision snapshots. |
 | `paper-execute <decision_id>` | Simulate a stored BUY decision against *its own* order-book snapshot. |
 | `settle <ticker> yes\|no --source "..." [--observed-high 77]` | Record a settlement by hand. |
 | `fetch-settlements` | Record results that the public market data reports as settled. |
 | `evaluate` | Score predictions against settlements. |
 | `status` | Paper ledger summary. |
+
+## The dashboard
+
+| Page | What it shows |
+|---|---|
+| **Today** | One card per city, filterable with the chips at the top. Each card shows today and tomorrow in the city's local time: your forecast (or a form to enter one), then one row per outcome ("75°F or above"). Each row has the price to buy YES and NO with how many are for sale, the model's chance, a small chart comparing the two, and a plain-English verdict with what to do next. |
+| **Contract details** | The question in plain words, the verdict and every reason behind it. Then the official rules to read and confirm, the prices you could actually pay (full order book on request), your forecast with a "±" what-if, and a receipt-style breakdown of price + fee + slippage vs. the model's chance. Technical fields are tucked into a collapsible section. |
+| **Cities** | The cities you follow, and every daily-high series Kalshi lists, each with a Follow button. |
+| **Paper account** | Virtual cash, positions, an account-value chart (hover for values), and recording results. |
+| **Results** | Accuracy scores explained in plain language, a "is 70% really 70%?" calibration table, and progress toward the 100+ settled predictions needed to mean anything. |
+| **How it works** | A glossary of every term on the pages. |
+
+Verdict colours always come with an icon and a label: green ✓ = paper-buy signal, yellow ! = something needs your action (refresh, forecast, read rules), grey – = no trade, red ✕ = a problem the app won't trade through. The pages follow your system's light/dark setting and stack into cards on phone-width screens.
 
 ## Daily workflow
 
@@ -103,6 +136,7 @@ The components are separate and each can be tested on its own.
 | Execution | `execution/base.py` (interface), `execution/paper.py` (only implementation) | No network access. |
 | Storage | `storage.py` | SQLite. Triggers abort any UPDATE or DELETE on every table. |
 | Evaluation | `evaluation.py` | Forward-test scoring only. |
+| Cities | `cities.py` | Tracked-city record and the timezone guess used on the Cities page. |
 | UI | `web.py` (stdlib HTTP server), `cli.py` | |
 
 ## Data sources and their limitations
@@ -132,14 +166,14 @@ The components are separate and each can be tested on its own.
   - If the period is missing, nothing is recorded. The app never fills in a value.
 - **Not reachable from the build environment either**, so it is tested only with a fixture.
 
-**Sample data** is fictional ("Sampleville"). It is shown with orange **SAMPLE DATA — FICTIONAL** banners and stored in its own database. It exists only to exercise the app.
+**Sample data** is fictional: two cities, "Sampleville" (Eastern time) and "Testburg" (Central time). It is shown with orange **SAMPLE DATA — FICTIONAL** banners and stored in its own database. It exists only to exercise the app.
 
 ## How to choose a city or series
 
-1. Run `discover --check-open` and pick a series that has open events.
+1. Open the **Cities** page (or run `discover --check-open`) and pick a series that has open events.
 2. Open one of its markets in the dashboard. Read the settlement source, the station and the verbatim rules.
-3. Set `timezone` to the city's IANA zone.
-4. If you use NWS, set a latitude/longitude close to the **settlement station**.
+3. Confirm the city's timezone. It decides which contracts count as "today" for that city.
+4. If you use NWS, set a latitude/longitude close to the **settlement station** (in `[[cities]]` or with `track --lat --lon`).
 
 Prefer a city where you can find a documented, timestamped forecast source you'll use consistently.
 

@@ -47,6 +47,7 @@ class Decision:
     reasons: list[str] = field(default_factory=list)
     sides: list[SideAnalysis] = field(default_factory=list)
     risk_notes: list[str] = field(default_factory=list)
+    codes: list[str] = field(default_factory=list)  # machine-readable, parallel to `reasons`
 
 
 def analyze_side(side: str, prob: float, book: OrderBook, cfg: PaperConfig) -> tuple[SideAnalysis, float | None]:
@@ -69,40 +70,46 @@ def decide(*, contract: Contract | None, book: OrderBook | None, book_captured_a
            forecast: ForecastInput | None, p_yes: float | None, now: datetime, cfg: PaperConfig,
            risk: RiskState, terms_acked: bool, snapshot_already_traded: bool = False) -> Decision:
     reasons: list[str] = []
+    codes: list[str] = []
+
+    def add(code: str, msg: str):
+        codes.append(code)
+        reasons.append(msg)
+
     if snapshot_already_traded:
         # the simulator never consumes the same displayed liquidity twice
-        reasons.append("a paper order already used this order-book snapshot; refresh for new quotes")
+        add("snapshot_used", "a paper order already used this order-book snapshot; refresh for new quotes")
     if contract is None:
-        return Decision("NO_TRADE", None, 0, None, 0.0, ["no market data"])
+        return Decision("NO_TRADE", None, 0, None, 0.0, ["no market data"], codes=["no_market"])
     if contract.status not in TRADABLE_STATUSES:
-        reasons.append(f"market status is {contract.status!r}, not open")
+        add("not_open", f"market status is {contract.status!r}, not open")
     if contract.close_time is not None and now >= contract.close_time:
-        reasons.append("market close time has passed")
+        add("closed", "market close time has passed")
     problems = contract.verification_problems()
     if problems:
-        reasons.append("contract terms cannot be verified: " + "; ".join(problems))
+        add("terms_unverified", "contract terms cannot be verified: " + "; ".join(problems))
     if cfg.require_terms_ack and not terms_acked:
-        reasons.append("you have not confirmed reading this market's rules text")
+        add("no_ack", "you have not confirmed reading this market's rules text")
     if forecast is None or p_yes is None:
-        reasons.append("no forecast available for this market's date (none is ever invented)")
+        add("no_forecast", "no forecast available for this market's date (none is ever invented)")
     else:
         if forecast.issued_at > now or forecast.recorded_at > now:
-            reasons.append("forecast is timestamped after decision time (look-ahead guard)")
+            add("forecast_future", "forecast is timestamped after decision time (look-ahead guard)")
         age_h = (now - forecast.issued_at).total_seconds() / 3600
         if age_h > cfg.max_forecast_age_hours:
-            reasons.append(f"forecast is stale ({age_h:.1f}h old > {cfg.max_forecast_age_hours}h)")
+            add("forecast_stale", f"forecast is stale ({age_h:.1f}h old > {cfg.max_forecast_age_hours}h)")
         if contract.target_date and forecast.target_date != contract.target_date:
-            reasons.append(f"forecast target date {forecast.target_date} != market date {contract.target_date}")
+            add("forecast_date", f"forecast target date {forecast.target_date} != market date {contract.target_date}")
     if book is None or book_captured_at is None:
-        reasons.append("no order book snapshot")
+        add("no_book", "no order book snapshot")
     else:
         age = (now - book_captured_at).total_seconds()
         if age < 0:
-            reasons.append("order book snapshot is from the future (look-ahead guard)")
+            add("book_future", "order book snapshot is from the future (look-ahead guard)")
         elif age > cfg.max_quote_age_seconds:
-            reasons.append(f"quote is stale ({age:.0f}s old > {cfg.max_quote_age_seconds}s)")
+            add("quote_stale", f"quote is stale ({age:.0f}s old > {cfg.max_quote_age_seconds}s)")
         if book.is_empty():
-            reasons.append("order book is empty")
+            add("book_empty", "order book is empty")
 
     sides: list[SideAnalysis] = []
     limits: dict[str, float | None] = {}
@@ -116,19 +123,19 @@ def decide(*, contract: Contract | None, book: OrderBook | None, book_captured_a
                                                          cfg.max_daily_loss))
     best = max((s for s in sides if s.edge is not None), key=lambda s: s.edge, default=None)
     if best is None and not reasons:
-        reasons.append("no executable ask on either side")
+        add("no_ask", "no executable ask on either side")
     elif best is not None and best.edge < cfg.safety_margin:
-        reasons.append(f"best edge {best.edge:+.3f} on {best.side.upper()} is below safety margin {cfg.safety_margin:.3f}")
+        add("small_edge", f"best edge {best.edge:+.3f} on {best.side.upper()} is below safety margin {cfg.safety_margin:.3f}")
     elif best is not None and best.fillable_qty < cfg.min_contracts:
-        reasons.append(f"book too thin: {best.fillable_qty} fillable contracts < minimum {cfg.min_contracts}")
+        add("thin", f"book too thin: {best.fillable_qty} fillable contracts < minimum {cfg.min_contracts}")
     if allowed <= 0:
-        reasons.append(risk_notes[0] if risk_notes else "risk limits exhausted")
+        add("risk", risk_notes[0] if risk_notes else "risk limits exhausted")
     elif best is not None and best.all_in_cost_per_contract and allowed < best.all_in_cost_per_contract * cfg.min_contracts:
-        reasons.append(f"risk limits allow only ${allowed:.2f}, less than one contract")
+        add("risk_small", f"risk limits allow only ${allowed:.2f}, less than one contract")
 
     if reasons or best is None:
-        return Decision("NO_TRADE", None, 0, None, 0.0, reasons, sides, risk_notes)
+        return Decision("NO_TRADE", None, 0, None, 0.0, reasons, sides, risk_notes, codes)
     qty = min(best.fillable_qty, int(allowed // best.all_in_cost_per_contract))
     return Decision("BUY_" + best.side.upper(), best.side, qty, limits[best.side], round(allowed, 4),
                     [f"edge {best.edge:+.3f} on {best.side.upper()} >= margin {cfg.safety_margin:.3f}"],
-                    sides, risk_notes)
+                    sides, risk_notes, ["trade"])

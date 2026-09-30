@@ -24,8 +24,8 @@ def test_forecast_recorded_later_is_invisible_to_earlier_decision(app, clock):
     # issued earlier but only RECORDED after t0 -> must not be visible as of t0
     app.add_forecast(target_date=date(2026, 9, 30), expected_high=75, unit="F", sigma=2,
                      issued_at=t0 - timedelta(hours=1), source="late entry")
-    assert app.forecast_at(date(2026, 9, 30), t0) is None
-    assert app.forecast_at(date(2026, 9, 30), clock()) is not None
+    assert app.forecast_at("SAMPLE-HIGHTEMP", date(2026, 9, 30), t0) is None
+    assert app.forecast_at("SAMPLE-HIGHTEMP", date(2026, 9, 30), clock()) is not None
     a = app.analyze("SAMPLE-HIGHTEMP-26SEP30-T74", as_of=t0)
     assert a["p_yes"] is None and a["decision"].action == "NO_TRADE"
 
