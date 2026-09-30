@@ -37,6 +37,28 @@ def rules_sha(market: dict) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_MONTHS_RE = ("January|February|March|April|May|June|July|August|September|October|November|December|"
+              "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec")
+_DATE_RES = [re.compile(rf"\b(?:{_MONTHS_RE})\.? \d{{1,2}}(?:st|nd|rd|th)?,? \d{{4}}\b"),
+             re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")]
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def rules_template(market: dict) -> str:
+    """Rules text with the parts that legitimately differ between contracts of one series blanked out:
+    dates become <DATE> and numbers (thresholds) become <N>. Everything else - station, source,
+    comparison wording - must match exactly for a city-wide acceptance to cover a contract."""
+    text = (market.get("rules_primary") or "") + "\n" + (market.get("rules_secondary") or "")
+    for r in _DATE_RES:
+        text = r.sub("<DATE>", text)
+    text = _NUM_RE.sub("<N>", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def template_sha(market: dict) -> str:
+    return hashlib.sha256(rules_template(market).encode("utf-8")).hexdigest()
+
+
 def make_source(cfg: AppConfig) -> MarketDataSource:
     if cfg.market.source == "sample":
         return SampleSource(cfg.market.timezone)
@@ -364,7 +386,12 @@ class App:
 
     def update(self, record_decisions: bool = False, force_forecasts: bool = False) -> dict:
         """One-stop update: snapshot prices, fetch automatic forecasts, optionally record decisions."""
-        r = {"prices": self.refresh(), "forecasts": self.auto_forecasts(force_forecasts), "decisions": 0}
+        r = {"prices": self.refresh(), "forecasts": self.auto_forecasts(force_forecasts), "decisions": 0,
+             "settled": [], "settle_error": ""}
+        try:
+            r["settled"] = self.fetch_settlements()
+        except Exception as e:  # reported, never guessed
+            r["settle_error"] = str(e)
         if record_decisions:
             for t in self.todays_tickers():
                 self.record_decision(t)
@@ -382,8 +409,55 @@ class App:
                                                 "rules_sha": rules_sha(json.loads(row["market_json"]))})
 
     def is_acked(self, ticker: str, as_of: datetime) -> bool:
+        """Accepted if you confirmed this exact rules text, or accepted the same wording city-wide."""
         _, row = self.contract_at(ticker, as_of)
-        return row is not None and self.store.terms_acked(ticker, rules_sha(json.loads(row["market_json"])), as_of)
+        if row is None:
+            return False
+        m = json.loads(row["market_json"])
+        if self.store.terms_acked(ticker, rules_sha(m), as_of):
+            return True
+        return self.store.one("SELECT 1 FROM rules_template_acks WHERE series_ticker=? AND template_sha=? AND created_at<=?",
+                              (row["series_ticker"], template_sha(m), to_iso(as_of))) is not None
+
+    def rules_templates(self, series_ticker: str) -> list[dict]:
+        """Distinct rules wordings among this city's current contracts (usually one per contract type)."""
+        now = self.clock()
+        out: dict[str, dict] = {}
+        for t in self.todays_tickers(series_ticker):
+            c, row = self.contract_at(t, now)
+            m = json.loads(row["market_json"])
+            sha = template_sha(m)
+            e = out.setdefault(sha, {"sha": sha, "template": rules_template(m), "example": c, "tickers": [],
+                                     "problems": c.verification_problems()})
+            e["tickers"].append(t)
+        for e in out.values():
+            e["accepted"] = self.store.one("SELECT 1 FROM rules_template_acks WHERE series_ticker=? AND template_sha=? "
+                                           "AND created_at<=?", (series_ticker, e["sha"], to_iso(now))) is not None
+        return list(out.values())
+
+    def accept_city_rules(self, series_ticker: str) -> int:
+        """Accept every rules wording currently shown for this city. Contracts whose wording later
+        changes (e.g. a new settlement station) are NOT covered and will ask again."""
+        n = 0
+        for e in self.rules_templates(series_ticker):
+            if e["accepted"]:
+                continue
+            if e["problems"]:
+                raise ValueError(f"{e['example'].ticker}: automatic rule checks failed ({'; '.join(e['problems'])}); "
+                                 "not accepting that wording")
+            self.store.insert("rules_template_acks", {"created_at": self.clock(), "series_ticker": series_ticker,
+                                                      "template_sha": e["sha"], "template_text": e["template"],
+                                                      "example_ticker": e["example"].ticker})
+            n += 1
+        return n
+
+    def city_rules_status(self, series_ticker: str) -> str:
+        """'accepted' | 'needs_review' | 'none' (no contracts saved yet)."""
+        ts = self.rules_templates(series_ticker)
+        if not ts:
+            return "none"
+        now = self.clock()
+        return "accepted" if all(self.is_acked(t, now) for e in ts for t in e["tickers"]) else "needs_review"
 
     # ---------------------------------------------------------------- positions / risk
     def positions(self) -> list[dict]:
@@ -540,15 +614,27 @@ class App:
     def fetch_settlements(self) -> list[str]:
         """Record results for known tickers that Kalshi's public data reports as settled."""
         done = {r["ticker"] for r in self.store.all("SELECT ticker FROM settlements")}
+        now = self.clock()
         recorded = []
         for t in self.known_tickers():
             if t in done:
                 continue
+            c, _ = self.contract_at(t, now)
+            # only markets that have closed within the last 3 weeks (avoids re-polling old history)
+            if c is None or c.close_time is None or not (now - timedelta(days=21) <= c.close_time <= now):
+                continue
             m = self.source.get_market(t)
             if (m.get("status") or "").lower() in SETTLED_STATUSES and (m.get("result") or "").lower() in ("yes", "no"):
+                observed = None
+                try:  # the reported value, if the market data includes it
+                    observed = float(m.get("expiration_value")) if m.get("expiration_value") not in (None, "") else None
+                except (TypeError, ValueError):
+                    observed = None
                 self.record_settlement(t, m["result"], f"{self.source.name} market.result (status={m.get('status')})",
+                                       observed_high=observed,
                                        raw={"status": m.get("status"), "result": m.get("result"),
-                                            "settlement_value": m.get("settlement_value")})
+                                            "settlement_value": m.get("settlement_value"),
+                                            "expiration_value": m.get("expiration_value")})
                 recorded.append(t)
         return recorded
 

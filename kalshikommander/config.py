@@ -57,6 +57,17 @@ class WeatherConfig:
 
 
 @dataclass
+class ReadinessConfig:
+    """Go/no-go targets for the Results page scorecard. Decide these BEFORE looking at results."""
+    min_predictions: int = 100          # settled pre-close predictions
+    min_settled_days: int = 30          # distinct contract dates (one day's contracts move together)
+    min_paper_trades: int = 50          # settled paper positions
+    confidence: float = 0.90            # share of day-bootstrap resamples where the model beats the market
+    stress_fill_fraction: float = 0.25  # re-simulate fills with this share of displayed size...
+    stress_extra_slippage: float = 0.01  # ...and this much extra slippage per contract
+
+
+@dataclass
 class AutoConfig:
     update_every_minutes: int = 0    # while `serve` runs: update prices+forecasts every N minutes (0 = off)
     record_decisions: bool = True    # automatic updates also record a timestamped decision per contract
@@ -69,6 +80,7 @@ class AppConfig:
     paper: PaperConfig = field(default_factory=PaperConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
     auto: AutoConfig = field(default_factory=AutoConfig)
+    readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     cities: list = field(default_factory=list)  # list[CityConfig]
     data_dir: str = "data"
     host: str = "127.0.0.1"
@@ -112,7 +124,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         if not path.exists():
             return cfg
     data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    for section in ("market", "model", "paper", "weather", "auto"):
+    for section in ("market", "model", "paper", "weather", "auto", "readiness"):
         if section in data:
             _apply(getattr(cfg, section), data.pop(section), section)
     for i, c in enumerate(data.pop("cities", []) or []):

@@ -86,7 +86,7 @@ If the dashboard isn't running, `python -m kalshikommander update` does the same
 
 What stays manual, on purpose:
 
-- **Reading each contract's rules once and confirming.**
+- **Reading each city's rules once and confirming** (one click per city; it asks again only if the wording changes).
 - **The "±" uncertainty**, which is a configured assumption (`[model] default_sigma_f`), not something the weather services provide.
 
 A forecast you type yourself is still accepted. Whichever forecast was issued most recently is used.
@@ -145,11 +145,15 @@ Verdict colours always come with an icon and a label: green ✓ = paper-buy sign
 ## Daily workflow
 
 1. Click **Update prices & forecasts** (or leave `serve --auto-update 15` running). This snapshots the markets and order books and fetches forecasts.
-2. Open a contract. **Read the verbatim rules.** If the "Interpreted YES set" matches them, click the acknowledgment. The acknowledgment is tied to a hash of that exact rules text, so a rules change requires a new acknowledgment.
+2. **Review each city's rules once.** A city's contracts share one rules wording apart from the date and temperature. Use **Review rules** on the city card, read the example for each wording (usually three: "or below", a range, "or above"), and accept them all with one click.
+   - Contracts whose wording matches exactly are then accepted automatically, today and in future.
+   - If anything else changes, such as the weather station, settlement source or comparison wording, those contracts ask again. Only dates and numbers are allowed to differ.
+   - Wordings that fail the automatic checks can't be accepted.
+   - You can still accept a single contract from its details page.
 3. Check the forecast. It arrives automatically, or you can enter one with its source, *issue* time, expected high and uncertainty σ.
 4. **Record a decision snapshot**. You get either a BUY decision or NO_TRADE with reasons.
 5. For a BUY, optionally **Simulate paper order**.
-6. After the market closes, use **Fetch settled results** or record the result manually. Then check **Evaluation**.
+6. Results are fetched automatically on each update once markets settle. This includes the reported high when Kalshi's data provides it. You can also record a result by hand on the Paper account page. Then check the **Readiness scorecard** on **Results**.
 
 ## Architecture
 
@@ -319,6 +323,40 @@ These are in `[paper]` and all amounts are virtual dollars, fees included:
 - Parameters fixed in advance.
 
 Even then, paper fills overstate real fills. Treat any edge as a hypothesis to test at tiny size.
+
+### The readiness scorecard (Results page)
+
+The scorecard turns the criteria above into a checklist. Each check shows pass/not-yet and its current value:
+
+| Check | Default target |
+|---|---|
+| Settled predictions | ≥ 100 |
+| Different contract days | ≥ 30 |
+| Model beats the market midpoint (day-resampled bootstrap of the Brier score) | ≥ 90% of resamples |
+| Settled paper trades | ≥ 50 |
+| Paper P&L after fees | > 0 |
+| Paper P&L with worse fills (same trades re-simulated on their own saved order books at 25% of shown size and +1¢ slippage) | > 0 |
+| Settings unchanged across the scored results | 1 combination |
+
+It also compares your "±" assumption with the forecast errors actually observed, once reported highs are recorded.
+
+- Targets live in `[readiness]` in `config.toml`. **Set them before looking at results and don't move them.**
+- SAMPLE data never counts.
+- Passing every check is **necessary, not sufficient**.
+
+### From paper to real money: the path
+
+1. **Now: forward-test on paper.**
+   - Leave `serve --auto-update 15` running with fixed settings.
+   - Let predictions, trades and results accumulate until the scorecard passes. For daily weather markets that is typically a few months.
+   - If you change a setting, treat it as a new test and start the count again.
+2. **Then: a separate, reviewed live-trading milestone.** This is not in this codebase, and no setting enables it. In order:
+   - Kalshi account verification and eligibility checks.
+   - API keys that you create and store outside the repo.
+   - A live adapter that runs first against **Kalshi's demo environment** (fake money).
+   - **Shadow mode:** logging the exact real orders it *would* place beside the paper fills, to measure the gap.
+   - Finally tiny real orders that **you confirm one by one**, with hard caps, a kill switch and account reconciliation.
+3. **Only risk money you can afford to lose entirely.** A model can pass every check and still stop working when the season or the market changes.
 
 ## What live trading would require (not built)
 

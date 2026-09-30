@@ -51,3 +51,12 @@ nws_user_agent = "KalshiKommander-research (your-email@example.com)"
 update_every_minutes = 0
 # Automatic updates also record a timestamped decision for every contract (no paper orders are placed).
 record_decisions = true
+
+[readiness]
+# Go/no-go targets for the Results page scorecard. Decide these BEFORE looking at results.
+min_predictions = 100
+min_settled_days = 30
+min_paper_trades = 50
+confidence = 0.90             # share of day-resampled tests in which the model beats the market
+stress_fill_fraction = 0.25   # "worse fills" check: re-simulate with this share of shown size...
+stress_extra_slippage = 0.01  # ...and this much extra slippage per contract

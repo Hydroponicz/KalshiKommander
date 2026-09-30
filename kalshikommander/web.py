@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from . import PAPER_LABEL
 from .cities import US_TIMEZONES, City
-from .evaluation import MIN_MEANINGFUL_N, evaluate
+from .evaluation import MIN_MEANINGFUL_N, evaluate, readiness
 from .service import App
 from .timeutil import parse_local_input, parse_ts
 
@@ -159,7 +159,7 @@ REASONS = {
     "forecast_stale": ("warn", "Forecast is too old", "Enter a newer forecast."),
     "forecast_date": ("warn", "Forecast is for a different day", "Enter a forecast for this date."),
     "terms_unverified": ("bad", "Rules couldn't be checked", "Open details to see which check failed. The app won't trade it."),
-    "no_ack": ("warn", "Read the rules first", "Open details and confirm you've read the official rules."),
+    "no_ack": ("warn", "Review this city's rules once", "Use “Review rules” at the top of the city card — one click covers all its contracts."),
     "snapshot_used": ("neutral", "Already paper-traded at these prices", "Refresh prices before another paper trade."),
     "book_empty": ("neutral", "Nobody is selling right now", ""),
     "no_ask": ("neutral", "Nobody is selling right now", ""),
@@ -363,9 +363,20 @@ class Dashboard:
             else:
                 probs = r["prices"]["errors"] + r["forecasts"]["errors"]
                 last = (f" Last update {self.ago(t)}: {r['forecasts']['saved']} new forecasts"
-                        + (f", {r['decisions']} decisions recorded" if r["decisions"] else "") + "."
+                        + (f", {r['decisions']} decisions recorded" if r["decisions"] else "")
+                        + (f", {len(r.get('settled') or [])} results recorded" if r.get("settled") else "") + "."
                         + (f" {pill('warn', 'Problems')} {E('; '.join(probs[:3]))}" if probs else ""))
         return f"<p class='small' style='margin:-6px 0 14px'>{fc}{loop}{last}</p>"
+
+    def _rules_banner(self, city: City) -> str:
+        st = self.app.city_rules_status(city.series_ticker)
+        link = f"/rules?s={urllib.parse.quote(city.series_ticker)}"
+        if st == "accepted":
+            return f"<p class='small'>{pill('good', 'Rules accepted')} <a href='{link}'>view</a></p>"
+        if st == "needs_review":
+            return (f"<p class='small'>{pill('warn', 'Rules need a one-time review')} "
+                    f"<a href='{link}'><b>Review rules</b></a> — one click covers all of this city’s contracts.</p>")
+        return ""
 
     def _forecast_box(self, city: City, d: date, f) -> str:
         app = self.app
@@ -424,7 +435,8 @@ class Dashboard:
         head = (f"<div class='city-h'><h2>{E(city.name)}</h2><span class='muted'>City time: "
                 f"{self.lt(now, city.timezone, '%a %I:%M %p %Z')} · series {E(city.series_ticker)} · "
                 f"<form class='inline' method='post' action='/refresh'><input type='hidden' name='series' "
-                f"value='{E(city.series_ticker)}'><button class='link'>refresh this city</button></form></span></div>")
+                f"value='{E(city.series_ticker)}'><button class='link'>refresh this city</button></form></span></div>"
+                f"{self._rules_banner(city)}")
         days = []
         for d in dates:
             f = app.forecast_at(city.series_ticker, d, now)
@@ -493,7 +505,9 @@ class Dashboard:
                   "".join(f"<li>{E(x)}</li>" for x in probs) + "</ul>")
         src = ", ".join(E(s.get("name", "")) + (" " + self._link(s.get("url"), "(link)") if s.get("url") else "")
                         for s in c.settlement_sources) or "none listed"
-        ack = (pill("good", "You confirmed reading these rules") if a["acked"] else
+        ack = (pill("good", "Rules accepted") if a["acked"] else
+               f"<p class='small'>Faster: <a href='/rules?s={urllib.parse.quote(c.series_ticker)}'>review this city's rules once</a> "
+               f"to accept every contract with the same wording.</p>"
                f"<form method='post' action='/ack'><input type='hidden' name='ticker' value='{E(t)}'>"
                "<button class='primary'>I’ve read the official rules and the summary above matches them</button></form>")
         links = " · ".join(x for x in [
@@ -760,6 +774,7 @@ class Dashboard:
                ("model was more accurate on these" if mb < kb else "market was more accurate on these" if kb < mb else "tie"))
         perf = self.app.performance()
         body = (f"<h1>Results</h1><p class='sub'>How the recorded predictions did once the real results came in. {PAPER_LABEL}.</p>"
+                + self._readiness_html() +
                 "<div class='card'>" + "".join(f"<p>{pill('warn', 'Note')} {E(w)}</p>" for w in r["warnings"]) +
                 f"<p class='small'>Settled predictions so far: <b>{n}</b> of the {MIN_MEANINGFUL_N}+ needed before the numbers mean much.</p>"
                 f"<div style='background:var(--track);border-radius:4px;height:8px;max-width:420px'><div style='width:{progress * 100:.0f}%;"
@@ -780,6 +795,72 @@ class Dashboard:
                 "recorded before trading closed.</p><div class='tw'><table><thead><tr><th>Contract</th><th>Decided</th>"
                 f"<th class='num'>Model</th><th class='num'>Market mid</th><th>Outcome</th></tr></thead><tbody>{preds}</tbody></table></div></details>")
         return self.page("Results", body, "results")
+
+    def _readiness_html(self) -> str:
+        rc = self.app.cfg.readiness
+        r = readiness(self.app.store, rc)
+        rows = "".join(
+            f"<tr><td>{pill('good', 'Pass') if c['ok'] else pill('neutral', 'Not yet')}</td><td><b>{E(c['name'])}</b>"
+            f"<div class='muted'>{E(c['why'])}</div></td><td class='num nowrap'>{E(c['value'])}</td></tr>" for c in r["checks"])
+        passed, total = sum(c["ok"] for c in r["checks"]), len(r["checks"])
+        sig = r["sigma"]
+        sigma = (f"<p class='small'><b>Checking the “±” guess:</b> across {sig['n']} settled days with a reported high, the actual "
+                 f"high differed from the forecast by {sig['sd_f']:.1f}°F on a typical day (average bias {sig['bias_f']:+.1f}°F); "
+                 f"you're assuming ±{self.app.cfg.model.default_sigma_f:g}°F. Don't change it mid-test — note it for the next test period.</p>"
+                 if sig else "<p class='muted'>Once results with reported highs come in, this also checks your “±” guess.</p>")
+        head = (pill("good", "All checks pass") + " Necessary, not sufficient: see “When could real money make sense?” below."
+                if r["all_ok"] else f"{pill('neutral', f'{passed} of {total} checks pass')} "
+                "Keep paper trading. Sample data never counts.")
+        return (f"<div class='card'><h2>Readiness scorecard</h2><p class='small'>{head}</p>"
+                f"<div class='tw'><table><tbody>{rows}</tbody></table></div>{sigma}"
+                f"<p class='muted'>Targets come from <code>[readiness]</code> in config.toml. Set them before looking at results and "
+                f"don't move them afterwards.</p></div>"
+                "<details class='card'><summary><b>When could real money make sense?</b></summary><ol class='small'>"
+                "<li><b>Now:</b> keep paper trading with fixed settings until every check above passes. For daily weather "
+                "markets that usually takes a few months.</li>"
+                "<li><b>Then:</b> ask for the separate live-trading milestone. It starts on Kalshi's demo environment (fake money), "
+                "then “shadow mode” (the app logs the real orders it <i>would</i> place next to paper fills), then tiny real orders "
+                "you confirm one by one, with hard caps and a kill switch.</li>"
+                "<li><b>Only risk money you can afford to lose entirely.</b> A model can pass every check and still stop working.</li>"
+                "</ol><p class='muted'>This app has no real-money trading code, and nothing here can turn it on.</p></details>")
+
+    # ------------------------------------------------------------ City rules review (one-time)
+    def rules_page(self, q: dict) -> str:
+        app = self.app
+        city = app.city(q.get("s", ""))
+        if city is None:
+            return self.page("Not found", "<p>Unknown city.</p>")
+        ts = app.rules_templates(city.series_ticker)
+        if not ts:
+            body = (f"<h1>{E(city.name)}: rules</h1><div class='card'><p>No contracts saved yet. "
+                    f"Go to <a href='/'>Today</a> and update prices first.</p></div>")
+            return self.page("Rules", body, "today", q.get("msg", ""), q.get("err") == "1")
+        blocks = []
+        for i, e in enumerate(ts, 1):
+            c = e["example"]
+            outcomes = ", ".join(sorted({app.contract_at(t, app.clock())[0].outcome_label() for t in e["tickers"]}))
+            src = ", ".join(E(x.get("name", "")) for x in c.settlement_sources) or "none listed"
+            status = (pill("good", "Accepted") if e["accepted"] else
+                      pill("bad", "Automatic checks failed: " + "; ".join(e["problems"])) if e["problems"] else
+                      pill("warn", "Not accepted yet"))
+            blocks.append(
+                f"<div class='box' style='margin-bottom:12px'><div class='city-h'><b>Wording {i} of {len(ts)} · "
+                f"covers {len(e['tickers'])} contract(s): {E(outcomes)}</b>{status}</div>"
+                f"<p class='small'>Example, verbatim ({E(c.ticker)}):</p><pre>{E(c.rules_primary)}</pre>"
+                + (f"<pre>{E(c.rules_secondary)}</pre>" if c.rules_secondary else "")
+                + f"<p class='small'><b>Settlement source:</b> {src}</p></div>")
+        pending = [e for e in ts if not e["accepted"]]
+        button = ("" if not pending else
+                  f"<form method='post' action='/accept_city_rules'><input type='hidden' name='series' value='{E(city.series_ticker)}'>"
+                  f"<button class='primary'>I’ve read these — accept them for all {E(city.name)} contracts</button></form>")
+        body = (f"<p class='small'><a href='/?city={urllib.parse.quote(city.series_ticker)}'>← {E(city.name)}</a></p>"
+                f"<h1>{E(city.name)}: review the rules once</h1>"
+                f"<p class='sub'>This city's contracts use the same rules wording apart from the date and the temperature. "
+                f"Read the example below; accepting it covers every current and future contract with exactly this wording. "
+                f"If Kalshi ever changes anything else (for example the weather station or source), those contracts "
+                f"will ask you again.</p><div class='card'>{''.join(blocks)}{button}"
+                + ("" if pending else pill("good", "All current wordings accepted")) + "</div>")
+        return self.page("Rules", body, "today", q.get("msg", ""), q.get("err") == "1")
 
     # ------------------------------------------------------------ Help
     def help_page(self, q: dict) -> str:
@@ -858,6 +939,9 @@ class Dashboard:
             provider = app.cfg.weather.provider
             n = app._fetch_city_forecast(city, provider, app.AUTO_SOURCES[provider], app.clock())
             return f"Fetched the forecast for {city.name}: {n} new." if n else f"No new forecast for {city.name} yet."
+        if path == "/accept_city_rules":
+            n = app.accept_city_rules(g("series"))
+            return f"Accepted {n} rules wording(s). Contracts with the same wording are covered from now on."
         if path == "/set_location":
             app.set_location(g("series"), float(g("lat")), float(g("lon")))
             return "Location saved. The next forecast update will use it."
@@ -904,7 +988,7 @@ class Dashboard:
 
 
 ROUTES = {"/": "index", "/market": "market", "/evaluate": "evaluate_page", "/cities": "cities_page",
-          "/ledger": "ledger_page", "/help": "help_page"}
+          "/ledger": "ledger_page", "/help": "help_page", "/rules": "rules_page"}
 
 
 def make_handler(dash: Dashboard, allowed_hosts: set[str]):

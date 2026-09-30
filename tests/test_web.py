@@ -17,7 +17,7 @@ def test_pages_render_and_label_paper(app, clock):
     assert "Needs your forecast" in d.index({})
     d.post("/forecast", {"series": "SAMPLE-HIGHTEMP", "target_date": "2026-09-30", "expected_high": "75.5", "unit": "F",
                          "sigma": "", "issued_at": "2026-09-30T08:00", "source": "manual"})
-    assert "Read the rules first" in d.index({})
+    assert "Review this city&#x27;s rules once" in d.index({}) or "Review this city's rules once" in d.index({})
     d.post("/ack", {"ticker": T})
     msg = d.post("/decide", {"ticker": T})
     assert "buy yes" in msg

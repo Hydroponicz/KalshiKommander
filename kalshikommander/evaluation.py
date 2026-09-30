@@ -20,9 +20,11 @@ MIN_MEANINGFUL_N = 100
 
 def scored_predictions(store: Store) -> list[dict]:
     rows = store.all(
-        "SELECT d.*, s.result, s.recorded_at settled_at, m.market_json, m.event_json, m.series_json "
+        "SELECT d.*, s.result, s.recorded_at settled_at, s.observed_high, m.market_json, m.event_json, m.series_json, "
+        "e.mu_f, e.sigma_f "
         "FROM decisions d JOIN settlements s ON s.ticker = d.ticker "
         "JOIN market_snapshots m ON m.id = d.market_snapshot_id "
+        "LEFT JOIN estimates e ON e.id = d.estimate_id "
         "WHERE d.p_yes IS NOT NULL ORDER BY d.created_at, d.id")
     best: dict[str, dict] = {}
     for r in rows:
@@ -33,8 +35,19 @@ def scored_predictions(store: Store) -> list[dict]:
             continue  # not a genuine pre-close prediction
         best[r["ticker"]] = {"ticker": r["ticker"], "created_at": r["created_at"], "p_yes": r["p_yes"],
                              "market_mid_yes": r["market_mid_yes"], "y": 1 if r["result"] == "yes" else 0,
-                             "action": r["action"], "is_sample": r["is_sample"]}
+                             "action": r["action"], "is_sample": r["is_sample"],
+                             "target_date": c.target_date, "series": c.series_ticker, "unit": c.unit,
+                             "mu_f": r["mu_f"], "sigma_f": r["sigma_f"], "observed_high": r["observed_high"],
+                             "settings": _settings_key(r["config_json"], r["sigma_f"])}
     return list(best.values())
+
+
+def _settings_key(config_json: str, sigma_f) -> str:
+    """Settings that change what the app predicts/trades; results mixed across these aren't one experiment."""
+    cfg = json.loads(config_json or "{}")
+    keep = {k: cfg.get(k) for k in ("safety_margin", "slippage_per_contract", "fill_fraction_of_displayed",
+                                    "taker_fee_rate", "max_stake_per_market")}
+    return json.dumps({**keep, "sigma_f": sigma_f}, sort_keys=True)
 
 
 def brier(ps: list[float], ys: list[int]) -> float | None:
@@ -83,3 +96,101 @@ def evaluate(store: Store) -> dict:
     res["warnings"].append("Historical backtest not possible: no point-in-time archive of past quotes/forecasts "
                            "exists here, and rebuilding one from later data would leak future information.")
     return res
+
+
+# ---------------------------------------------------------------- readiness scorecard
+def paper_trade_results(store: Store, stress_fill_fraction: float, stress_extra_slippage: float) -> list[dict]:
+    """Settled paper trades: actual P&L, and P&L if fills had been worse (re-simulated against the SAME
+    stored order-book snapshot with a smaller fill share and extra slippage, never spending more)."""
+    from .execution.base import OrderRequest
+    from .execution.paper import PaperExecutionAdapter
+    from .orderbook import parse_orderbook
+    rows = store.all(
+        "SELECT o.id, o.ticker, o.side, o.requested_qty, o.limit_price, s.result, d.config_json, "
+        "b.orderbook_json, b.captured_at, d.is_sample, "
+        "(SELECT SUM(qty) FROM paper_fills f WHERE f.order_id=o.id) qty, "
+        "(SELECT SUM(cost) FROM paper_fills f WHERE f.order_id=o.id) cost, "
+        "(SELECT MAX(slippage) FROM paper_fills f WHERE f.order_id=o.id) slip "
+        "FROM paper_orders o JOIN settlements s ON s.ticker=o.ticker JOIN decisions d ON d.id=o.decision_id "
+        "JOIN orderbook_snapshots b ON b.id=d.orderbook_snapshot_id")
+    out = []
+    for r in rows:
+        if not r["qty"]:
+            continue
+        cfg = json.loads(r["config_json"] or "{}")
+        won = r["result"] == r["side"]
+        actual = (r["qty"] if won else 0) - r["cost"]
+        ex = PaperExecutionAdapter(cfg.get("taker_fee_rate", 0.07), (r["slip"] or 0) + stress_extra_slippage,
+                                   stress_fill_fraction, 10 ** 9)
+        ts = parse_ts(r["captured_at"])
+        rep = ex.submit(OrderRequest(r["ticker"], r["side"], int(r["requested_qty"]), float(r["limit_price"]),
+                                     float(r["cost"])), parse_orderbook(json.loads(r["orderbook_json"])), ts, ts)
+        stressed = (rep.qty if won else 0) - rep.cost
+        out.append({"ticker": r["ticker"], "actual_pnl": round(actual, 4), "stress_pnl": round(stressed, 4),
+                    "is_sample": r["is_sample"]})
+    return out
+
+
+def bootstrap_beats_market(preds: list[dict], n_boot: int = 2000, seed: int = 7) -> float | None:
+    """Share of resamples (by contract DATE, since one day's contracts share one weather outcome) in which
+    the model's Brier score is lower than the market midpoint's."""
+    import random
+    by_day: dict = {}
+    for p in preds:
+        if p["market_mid_yes"] is None:
+            continue
+        d = (p["p_yes"] - p["y"]) ** 2 - (p["market_mid_yes"] - p["y"]) ** 2
+        by_day.setdefault((p["series"], p["target_date"]), []).append(d)
+    days = list(by_day.values())
+    if len(days) < 2:
+        return None
+    rng = random.Random(seed)
+    wins = 0
+    for _ in range(n_boot):
+        sample = [x for _ in days for x in rng.choice(days)]
+        wins += (sum(sample) / len(sample)) < 0
+    return wins / n_boot
+
+
+def sigma_check(preds: list[dict]) -> dict | None:
+    """Observed forecast errors (reported high minus forecast), when reported highs were recorded."""
+    errs = [p["observed_high"] - p["mu_f"] for p in preds
+            if p["observed_high"] is not None and p["mu_f"] is not None and p["unit"] == "F"]
+    if len(errs) < 2:
+        return None
+    mean = sum(errs) / len(errs)
+    sd = (sum((e - mean) ** 2 for e in errs) / (len(errs) - 1)) ** 0.5
+    return {"n": len(errs), "bias_f": round(mean, 2), "sd_f": round(sd, 2)}
+
+
+def readiness(store: Store, rc) -> dict:
+    """Pre-registered go/no-go checklist. Passing is necessary, not sufficient, for considering real money."""
+    preds = [p for p in scored_predictions(store) if not p["is_sample"]]
+    trades = [t for t in paper_trade_results(store, rc.stress_fill_fraction, rc.stress_extra_slippage)
+              if not t["is_sample"]]
+    days = {(p["series"], p["target_date"]) for p in preds}
+    conf = bootstrap_beats_market(preds)
+    pnl = round(sum(t["actual_pnl"] for t in trades), 2)
+    stress = round(sum(t["stress_pnl"] for t in trades), 2)
+    settings = {p["settings"] for p in preds}
+    checks = [
+        ("Enough settled predictions", len(preds) >= rc.min_predictions, f"{len(preds)} of {rc.min_predictions}",
+         "Each is the last prediction recorded before a contract closed."),
+        ("Enough different days", len(days) >= rc.min_settled_days, f"{len(days)} of {rc.min_settled_days}",
+         "Contracts on the same day share one weather outcome, so days matter more than contracts."),
+        ("Model beats the market's own prices", conf is not None and conf >= rc.confidence,
+         "not enough data" if conf is None else f"{conf:.0%} confident (need {rc.confidence:.0%})",
+         "Compares accuracy (Brier score) with the market midpoint, resampling whole days."),
+        ("Enough settled paper trades", len(trades) >= rc.min_paper_trades, f"{len(trades)} of {rc.min_paper_trades}",
+         "Paper trades that have reached a result."),
+        ("Profitable after fees", bool(trades) and pnl > 0, f"${pnl:,.2f}", "Realized paper P&L including fees and slippage."),
+        ("Still profitable with worse fills", bool(trades) and stress > 0, f"${stress:,.2f}",
+         f"Same trades re-simulated with only {rc.stress_fill_fraction:.0%} of shown size and "
+         f"+{rc.stress_extra_slippage * 100:.0f}¢ slippage."),
+        ("Settings unchanged during the test", len(settings) <= 1,
+         "no data" if not settings else f"{len(settings)} different setting combination(s)",
+         "Changing the margin, ± or fill rules mid-test mixes different experiments."),
+    ]
+    return {"checks": [{"name": n, "ok": ok, "value": v, "why": w} for n, ok, v, w in checks],
+            "all_ok": all(ok for _, ok, _, _ in checks), "sigma": sigma_check(preds),
+            "n_days": len(days), "n_preds": len(preds), "n_trades": len(trades)}
