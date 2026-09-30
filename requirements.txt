@@ -1,0 +1,2 @@
+# Runtime: Python 3.11+ standard library only, plus IANA tz data for Windows (zoneinfo).
+tzdata>=2024.1

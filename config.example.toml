@@ -1,0 +1,38 @@
+# KalshiKommander configuration. Copy to config.toml and edit.
+# PAPER / SIMULATED ONLY: there is deliberately no setting that enables live trading,
+# and keys such as api_key / live_trading are rejected on load.
+
+[market]
+# "sample"        -> clearly labeled fictional data (works offline; separate data/sample.db)
+# "kalshi_public" -> Kalshi's public, unauthenticated market-data API (data/kalshi_public.db)
+source = "sample"
+# Run `python -m kalshikommander discover --check-open` and paste a series ticker here.
+series_ticker = ""
+city_label = ""
+# IANA timezone of the city whose weather settles the market (used for local dates/display).
+timezone = "America/New_York"
+
+[model]
+# ASSUMPTION, not calibrated: std. dev. (°F) of (reported high - forecast high).
+default_sigma_f = 3.0
+sensitivity_sigmas_f = [1.5, 2.0, 3.0, 4.0, 5.0]
+
+[paper]
+starting_cash = 1000.0
+taker_fee_rate = 0.07          # verify against Kalshi's current fee schedule
+safety_margin = 0.05           # required edge after fees and slippage (probability points)
+slippage_per_contract = 0.01   # $ added to every simulated fill
+fill_fraction_of_displayed = 0.5
+min_contracts = 1
+max_quote_age_seconds = 300
+max_forecast_age_hours = 12.0
+max_stake_per_market = 25.0
+max_total_exposure = 100.0
+max_daily_loss = 50.0
+require_terms_ack = true
+
+[weather]
+provider = "manual"            # or "nws" to enable the optional api.weather.gov button (US only)
+# latitude = 40.7789
+# longitude = -73.9692
+nws_user_agent = "KalshiKommander-research (your-email@example.com)"
