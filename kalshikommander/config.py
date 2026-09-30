@@ -48,10 +48,18 @@ class PaperConfig:
 
 @dataclass
 class WeatherConfig:
-    provider: str = "manual"        # "manual" or "nws" (optional api.weather.gov helper)
-    latitude: float | None = None
+    # Automatic forecast source: "open_meteo" (free, worldwide), "nws" (free, US only) or "manual" (off).
+    provider: str = "open_meteo"
+    refetch_minutes: int = 60        # fetch at most this often per city
+    latitude: float | None = None    # legacy single-city location
     longitude: float | None = None
     nws_user_agent: str = "KalshiKommander-research (set-your-email@example.com)"
+
+
+@dataclass
+class AutoConfig:
+    update_every_minutes: int = 0    # while `serve` runs: update prices+forecasts every N minutes (0 = off)
+    record_decisions: bool = True    # automatic updates also record a timestamped decision per contract
 
 
 @dataclass
@@ -60,6 +68,7 @@ class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    auto: AutoConfig = field(default_factory=AutoConfig)
     cities: list = field(default_factory=list)  # list[CityConfig]
     data_dir: str = "data"
     host: str = "127.0.0.1"
@@ -103,7 +112,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         if not path.exists():
             return cfg
     data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    for section in ("market", "model", "paper", "weather"):
+    for section in ("market", "model", "paper", "weather", "auto"):
         if section in data:
             _apply(getattr(cfg, section), data.pop(section), section)
     for i, c in enumerate(data.pop("cities", []) or []):
@@ -115,6 +124,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         cfg.cities.append(city)
     _apply(cfg, data, "top-level")
     _check_tz(cfg.market.timezone)
+    if cfg.weather.provider not in ("open_meteo", "nws", "manual"):
+        raise ValueError("weather.provider must be 'open_meteo', 'nws' or 'manual'")
+    if cfg.auto.update_every_minutes and cfg.auto.update_every_minutes < 5:
+        raise ValueError("auto.update_every_minutes must be 0 (off) or at least 5")
     if cfg.market.source not in ("sample", "kalshi_public"):
         raise ValueError("market.source must be 'sample' or 'kalshi_public'")
     if cfg.host not in ("127.0.0.1", "localhost", "::1"):

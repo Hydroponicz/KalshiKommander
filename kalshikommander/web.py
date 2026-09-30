@@ -324,15 +324,92 @@ class Dashboard:
         chips = "<div class='chips'>" + "".join(
             f"<a href='/?city={urllib.parse.quote(k)}' class='{'on' if sel == k else ''}'>{E(n)}</a>"
             for k, n in [("", "All cities")] + [(c.series_ticker, c.name) for c in cities]) + "</div>"
-        toolbar = ("<div class='toolbar'><form class='inline' method='post' action='/refresh'>"
-                   f"<button class='primary'>Refresh prices{' for all cities' if len(cities) > 1 else ''}</button></form>"
-                   f"<span class='muted'>Each refresh saves a timestamped copy of prices and order books. "
-                   f"Prices older than {app.cfg.paper.max_quote_age_seconds // 60} minutes are treated as stale.</span></div>")
+        auto = app.auto_forecasts_enabled()
+        label = "Update prices & forecasts" if auto else f"Refresh prices{' for all cities' if len(cities) > 1 else ''}"
+        toolbar = ("<div class='toolbar'><form class='inline' method='post' action='/update'>"
+                   f"<button class='primary'>{E(label)}</button></form>"
+                   f"<span class='muted'>Saves a timestamped copy of prices"
+                   f"{' and fetches forecasts' if auto else ''}. Prices older than "
+                   f"{app.cfg.paper.max_quote_age_seconds // 60} minutes are treated as stale.</span></div>"
+                   f"{self._auto_status()}")
         cards = "".join(self._city_card(c) for c in cities if not sel or c.series_ticker == sel)
         body = (f"<h1>Today’s weather contracts</h1><p class='sub'>Daily high-temperature markets for "
                 f"{len(cities)} {'city' if len(cities) == 1 else 'cities'}. Model estimates are not calibrated.</p>"
                 f"{steps}<div class='card'>{kp}</div>{toolbar}{chips}{cards}")
         return self.page("Today", body, "today", q.get("msg", ""), q.get("err") == "1")
+
+    def _auto_status(self) -> str:
+        app = self.app
+        w = app.cfg.weather
+        if app.source.is_sample:
+            fc = "Automatic forecasts are off in sample mode (fictional cities), so enter forecasts by hand."
+        elif app.auto_forecasts_enabled():
+            name = app.AUTO_SOURCES[w.provider].replace(" (automatic)", "")
+            fc = (f"Forecasts arrive automatically from <b>{E(name)}</b>, fetched at most every "
+                  f"{w.refetch_minutes} min per city.")
+        else:
+            fc = "Automatic forecasts are off (<code>weather.provider = &quot;manual&quot;</code>), so enter forecasts by hand."
+        every = getattr(app, "auto_every", 0)
+        if every:
+            loop = (f" The app also updates itself every {every} min while it's running"
+                    + (" and records a decision snapshot for every contract." if app.cfg.auto.record_decisions else "."))
+        else:
+            loop = " Tip: start it with <code>serve --auto-update 15</code> to keep everything updated hands-free."
+        last = ""
+        if app.last_update:
+            t, r = app.last_update
+            if "error" in r:
+                last = f" {pill('bad', 'Last automatic update failed')} {E(r['error'])}"
+            else:
+                probs = r["prices"]["errors"] + r["forecasts"]["errors"]
+                last = (f" Last update {self.ago(t)}: {r['forecasts']['saved']} new forecasts"
+                        + (f", {r['decisions']} decisions recorded" if r["decisions"] else "") + "."
+                        + (f" {pill('warn', 'Problems')} {E('; '.join(probs[:3]))}" if probs else ""))
+        return f"<p class='small' style='margin:-6px 0 14px'>{fc}{loop}{last}</p>"
+
+    def _forecast_box(self, city: City, d: date, f) -> str:
+        app = self.app
+        auto = app.auto_forecasts_enabled()
+        manual = self._forecast_form(city, d)
+        fetch = ""
+        if auto and city.latitude is not None:
+            fetch = (f"<form method='post' action='/fetch_forecasts' class='inline'><input type='hidden' name='series' "
+                     f"value='{E(city.series_ticker)}'><button class='link'>fetch forecast now</button></form>")
+        if f is None:
+            if auto and city.latitude is None:
+                why = (f"{pill('warn', 'No location for automatic forecasts')} <span class='small'>Set this city's "
+                       f"location on the <a href='/cities'>Cities</a> page, or enter a forecast yourself below.</span>")
+            elif auto:
+                why = (f"{pill('warn', 'No forecast yet')} <span class='small'>Click “Update prices &amp; forecasts” "
+                       f"(or {fetch}). Nothing is filled in until a real forecast arrives.</span>")
+                manual = f"<details><summary class='small'>Or enter your own forecast</summary>{manual}</details>"
+            else:
+                why = (f"{pill('warn', 'No forecast yet')} <span class='small'>Enter one to get estimates for this day. "
+                       f"The app never makes one up.</span>")
+            return f"<div class='fc'>{why}{manual}</div>"
+        is_auto = f["source"].endswith("(automatic)")
+        assumed = " (default guess)" if f["sigma_is_assumption"] else ""
+        when = "fetched" if f["source"].startswith("Open-Meteo") else "issued"
+        who = "Automatic forecast" if is_auto else "Your forecast"
+        return (f"<div class='fc'><b>{who}:</b> high of {f['expected_high']:g}°{E(f['unit'])} ± {f['sigma_f']:.1f}°F{assumed} · "
+                f"from {E(f['source'].replace(' (automatic)', ''))}, {when} {self.lt(f['issued_at'])}"
+                + (f" · {fetch}" if fetch else "")
+                + f"<details><summary class='small'>Enter your own forecast instead</summary>{manual}"
+                f"<p class='muted'>Whichever forecast was issued most recently is the one used.</p></details></div>")
+
+    def _location_cell(self, c: City) -> str:
+        if c.origin == "sample":
+            return "<span class='muted'>fictional</span>"
+        cur = (f"{c.latitude:.4f}, {c.longitude:.4f}<div class='muted'>{E(c.location_note)}</div>" if c.latitude is not None
+               else pill("warn", "Not set") + "<div class='muted'>needed for automatic forecasts</div>")
+        lat = "" if c.latitude is None else c.latitude
+        lon = "" if c.longitude is None else c.longitude
+        return (f"{cur}<details><summary class='small'>{'Change' if c.latitude is not None else 'Set'} location</summary>"
+                f"<form method='post' action='/set_location' class='formrow'><input type='hidden' name='series' value='{E(c.series_ticker)}'>"
+                f"<label>Latitude<input type='number' step='0.0001' name='lat' required value='{lat}'></label>"
+                f"<label>Longitude<input type='number' step='0.0001' name='lon' required value='{lon}'></label>"
+                f"<label>&nbsp;<button>Save</button></label></form><p class='muted'>Use the weather station named in the "
+                f"contract's rules (search the station name plus “coordinates”).</p></details>")
 
     def _city_card(self, city: City) -> str:
         app = self.app
@@ -351,19 +428,7 @@ class Dashboard:
         days = []
         for d in dates:
             f = app.forecast_at(city.series_ticker, d, now)
-            nws = ""
-            if app.cfg.weather.provider == "nws":
-                nws = (f"<form method='post' action='/nws' class='inline'><input type='hidden' name='series' value='{E(city.series_ticker)}'>"
-                       f"<input type='hidden' name='target_date' value='{d.isoformat()}'>"
-                       f"<button>Fetch NWS forecast</button></form> <span class='muted'>optional helper, US only</span>")
-            if f is None:
-                fc = (f"<div class='fc'>{pill('warn', 'No forecast yet')} <span class='small'>Enter one to get estimates "
-                      f"for this day. The app never makes one up.</span>{self._forecast_form(city, d)}{nws}</div>")
-            else:
-                assumed = " (default guess)" if f["sigma_is_assumption"] else ""
-                fc = (f"<div class='fc'><b>Your forecast:</b> high of {f['expected_high']:g}°{E(f['unit'])} "
-                      f"± {f['sigma_f']:.1f}°F{assumed} · from {E(f['source'])}, issued {self.lt(f['issued_at'])} "
-                      f"<details><summary class='small'>Enter a newer forecast</summary>{self._forecast_form(city, d)}{nws}</details></div>")
+            fc = self._forecast_box(city, d, f)
             rows = []
             for a in by_date[d]:
                 c, b, dec = a["contract"], a["book"], a["decision"]
@@ -537,11 +602,11 @@ class Dashboard:
             [sel] if sel and sel not in US_TIMEZONES else []))
         rows = "".join(
             f"<tr><td><b>{E(c.name)}</b></td><td>{E(c.series_ticker)}</td><td>{E(c.timezone)}</td>"
-            f"<td>{'' if c.latitude is None else f'{c.latitude:.3f}, {c.longitude:.3f}'}</td>"
+            f"<td>{self._location_cell(c)}</td>"
             f"<td class='muted'>{ {'config': 'config.toml', 'dashboard': 'added here', 'sample': 'sample data'}[c.origin] }</td>"
             f"<td>{self._untrack_btn(c)}</td></tr>" for c in app.cities())
         tracked = (f"<div class='card'><h2>Cities you’re following</h2><div class='tw'><table><thead><tr><th>City</th><th>Series</th>"
-                   f"<th>City timezone</th><th>Lat, lon (optional)</th><th>Added via</th><th></th></tr></thead><tbody>{rows}"
+                   f"<th>City timezone</th><th>Forecast location</th><th>Added via</th><th></th></tr></thead><tbody>{rows}"
                    "</tbody></table></div></div>") if rows else ""
         if app.source.is_sample:
             find = ("<div class='card'><h2>Add more cities</h2><p>You're in <b>sample mode</b>, which shows two fictional cities. "
@@ -725,7 +790,11 @@ class Dashboard:
             ("Price", "What one contract costs, in cents. A YES price of 16¢ means traders collectively put the chance near 16%."),
             ("YES costs / NO costs", "The cheapest price you could actually buy at right now, from the order book — not the "
                                      "midpoint or the last trade."),
-            ("Your forecast", "The expected high you enter, where it came from, and when it was issued. The app never invents one."),
+            ("Forecast", "The expected high for a city and day. It arrives automatically from a free weather service "
+                         "(Open-Meteo by default, or the US National Weather Service) for the city's forecast location, "
+                         "or you can enter your own. Only real fetched or entered values are used; the app never invents one."),
+            ("Forecast location", "Where the automatic forecast is for. It should be the weather station named in the "
+                                  "contract's rules. Known cities get a suggested station you can change on the Cities page."),
             ("Give or take (±)", f"How far off you think the forecast could be (one standard deviation). The default is "
                                  f"{self.app.cfg.model.default_sigma_f:g}°F and is a guess until checked against real results."),
             ("Model’s chance", "The chance of YES if the real high lands around your forecast with that ± spread, rounded to "
@@ -771,6 +840,27 @@ class Dashboard:
                                    issued_at=parse_local_input(g("issued_at"), app.tz), source=g("source"),
                                    series_ticker=g("series") or None, source_detail=g("source_detail"), notes=g("notes"))
             return f"Saved forecast #{fid}."
+        if path == "/update":
+            r = app.update()
+            f = r["forecasts"]
+            msg = f"Saved fresh prices for {r['prices']['markets']} contracts"
+            msg += f" and {f['saved']} new forecasts." if app.auto_forecasts_enabled() else "."
+            probs = r["prices"]["errors"] + f["errors"] + [x for x in f["skipped"] if "no location" in x]
+            if probs:
+                msg += " Problems: " + "; ".join(probs[:4])
+            return msg
+        if path == "/fetch_forecasts":
+            city = app.city(g("series"))
+            if city is None:
+                raise ValueError("unknown city")
+            if not app.auto_forecasts_enabled():
+                raise ValueError("automatic forecasts are off")
+            provider = app.cfg.weather.provider
+            n = app._fetch_city_forecast(city, provider, app.AUTO_SOURCES[provider], app.clock())
+            return f"Fetched the forecast for {city.name}: {n} new." if n else f"No new forecast for {city.name} yet."
+        if path == "/set_location":
+            app.set_location(g("series"), float(g("lat")), float(g("lon")))
+            return "Location saved. The next forecast update will use it."
         if path == "/nws":
             return f"Saved NWS forecast #{app.fetch_nws(date.fromisoformat(g('target_date')), g('series') or None)}."
         if path == "/ack":
@@ -872,10 +962,32 @@ def make_handler(dash: Dashboard, allowed_hosts: set[str]):
     return Handler
 
 
-def serve(app: App, host: str, port: int):
+def serve(app: App, host: str, port: int, every_minutes: int = 0):
+    """Serve the dashboard. With every_minutes > 0, also run app.update() on that schedule.
+
+    Requests and updates run in the same thread (one after another), so the database is never
+    written from two threads at once."""
+    import time
     httpd = HTTPServer((host, port), make_handler(Dashboard(app), {"127.0.0.1", "localhost", "::1"}))
+    httpd.timeout = 1.0
+    app.auto_every = every_minutes
     print(f"{PAPER_LABEL} dashboard: http://{host}:{port}/  (Ctrl+C to stop)")
+    if every_minutes:
+        print(f"Auto-update every {every_minutes} min: prices + forecasts"
+              + (" + decision snapshots" if app.cfg.auto.record_decisions else ""))
+    next_due = time.monotonic() if every_minutes else None
     try:
-        httpd.serve_forever()
+        while True:
+            httpd.handle_request()
+            if next_due is not None and time.monotonic() >= next_due:
+                next_due = time.monotonic() + every_minutes * 60
+                try:
+                    r = app.update(record_decisions=app.cfg.auto.record_decisions)
+                    print(f"[auto-update] {r['prices']['markets']} prices, {r['forecasts']['saved']} forecasts, "
+                          f"{r['decisions']} decisions" + (f"; problems: {r['prices']['errors'] + r['forecasts']['errors']}"
+                                                          if r['prices']['errors'] or r['forecasts']['errors'] else ""))
+                except Exception as e:
+                    app.last_update = (app.clock(), {"error": str(e)})
+                    print(f"[auto-update] failed: {e}")
     except KeyboardInterrupt:
         pass

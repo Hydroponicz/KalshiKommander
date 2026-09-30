@@ -37,11 +37,17 @@ require_terms_ack = true
 # series_ticker = "KXHIGHCHI"
 # label = "Chicago"
 # timezone = "America/Chicago"
-# latitude = 41.79      # optional, for the NWS forecast helper
+# latitude = 41.79      # optional forecast location; known cities get a suggested station
 # longitude = -87.75
 
 [weather]
-provider = "manual"            # or "nws" to enable the optional api.weather.gov button (US only)
-# latitude = 40.7789
-# longitude = -73.9692
+# Automatic forecasts: "open_meteo" (free, worldwide), "nws" (free, US only) or "manual" (type them yourself).
+provider = "open_meteo"
+refetch_minutes = 60           # fetch at most this often per city
 nws_user_agent = "KalshiKommander-research (your-email@example.com)"
+
+[auto]
+# While `serve` runs, update prices + forecasts every N minutes (0 = off, minimum 5).
+update_every_minutes = 0
+# Automatic updates also record a timestamped decision for every contract (no paper orders are placed).
+record_decisions = true

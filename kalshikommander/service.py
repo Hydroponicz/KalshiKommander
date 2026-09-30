@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from . import PAPER_LABEL
-from .cities import City, guess_label, guess_timezone
+from .cities import City, guess_label, guess_timezone, suggest_station
 from .config import AppConfig
 from .contracts import Contract, parse_contract
 from .decision import ForecastInput, decide
@@ -50,6 +50,8 @@ class App:
         self.source = source or make_source(cfg)
         self.store = store or Store(cfg.db_path)
         self.clock = clock
+        self.http_opener = None  # injectable for tests; weather providers use urllib by default
+        self.last_update = None  # (time, summary) of the most recent update()
         p = cfg.paper
         self.executor = PaperExecutionAdapter(p.taker_fee_rate, p.slippage_per_contract,
                                               p.fill_fraction_of_displayed, p.max_quote_age_seconds)
@@ -87,7 +89,30 @@ class App:
                                                    r["latitude"], r["longitude"], origin="dashboard")
                 elif out.get(r["series_ticker"]) and out[r["series_ticker"]].origin == "dashboard":
                     out.pop(r["series_ticker"])
-        return list(out.values())
+        return [self._with_location(c) for c in out.values()]
+
+    def _with_location(self, c: City) -> City:
+        """Forecast location: your saved location > config/track coordinates > suggested station."""
+        row = self.store.one("SELECT * FROM city_locations WHERE series_ticker=? ORDER BY id DESC LIMIT 1",
+                             (c.series_ticker,))
+        if row is not None:
+            c.latitude, c.longitude, c.location_note = row["latitude"], row["longitude"], row["note"] or "set by you"
+        elif c.latitude is not None and c.longitude is not None:
+            c.location_note = "from config.toml" if c.origin == "config" else "set when followed"
+        elif c.origin != "sample":
+            hint = suggest_station(c.label, c.series_ticker)
+            if hint:
+                c.location_note = f"suggested: {hint[0]} — check against the contract rules"
+                c.latitude, c.longitude = hint[1], hint[2]
+        return c
+
+    def set_location(self, series_ticker: str, latitude: float, longitude: float, note: str = "set by you") -> int:
+        if self.city(series_ticker) is None:
+            raise ValueError("unknown city")
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError("latitude must be -90..90 and longitude -180..180")
+        return self.store.insert("city_locations", {"created_at": self.clock(), "series_ticker": series_ticker,
+                                                    "latitude": latitude, "longitude": longitude, "note": note})
 
     def city(self, series_ticker: str) -> City | None:
         return next((c for c in self.cities() if c.series_ticker == series_ticker), None)
@@ -272,6 +297,80 @@ class App:
 
     def forecast_at(self, series_ticker: str, target: date, as_of: datetime):
         return self.store.latest_forecast(series_ticker, target.isoformat(), as_of, self.legacy_series)
+
+    # ---------------------------------------------------------------- automatic forecasts
+    AUTO_SOURCES = {"open_meteo": "Open-Meteo (automatic)", "nws": "NWS api.weather.gov (automatic)"}
+
+    def auto_forecasts_enabled(self) -> bool:
+        return self.cfg.weather.provider in self.AUTO_SOURCES and not self.source.is_sample
+
+    def auto_forecasts(self, force: bool = False) -> dict:
+        """Fetch and store forecasts for every city's today/tomorrow from the configured provider.
+
+        Only real fetched values are stored (never interpolated or invented). Each city is fetched at
+        most every `refetch_minutes` unless `force`. The "±" uses the configured default assumption."""
+        res = {"saved": 0, "skipped": [], "errors": []}
+        if self.source.is_sample:
+            res["skipped"].append("sample mode: automatic forecasts only run for real cities")
+            return res
+        provider = self.cfg.weather.provider
+        if provider not in self.AUTO_SOURCES:
+            res["skipped"].append("automatic forecasts are off (weather.provider = \"manual\")")
+            return res
+        source = self.AUTO_SOURCES[provider]
+        now = self.clock()
+        for city in self.cities():
+            if city.latitude is None or city.longitude is None:
+                res["skipped"].append(f"{city.name}: no location set")
+                continue
+            last = self.store.one("SELECT MAX(recorded_at) t FROM forecasts WHERE series_ticker=? AND source=?",
+                                  (city.series_ticker, source))["t"]
+            if not force and last and (now - parse_ts(last)).total_seconds() < self.cfg.weather.refetch_minutes * 60:
+                continue
+            try:
+                res["saved"] += self._fetch_city_forecast(city, provider, source, now)
+            except Exception as e:  # network/format problems are reported, never papered over
+                res["errors"].append(f"{city.name}: {e}")
+        return res
+
+    def _fetch_city_forecast(self, city: City, provider: str, source: str, now: datetime) -> int:
+        where = f"lat {city.latitude:.4f}, lon {city.longitude:.4f} ({city.location_note or 'location'})"
+        rows = []  # (date, value, unit, issued_at, detail)
+        if provider == "open_meteo":
+            from .weather.open_meteo import fetch_open_meteo
+            highs, url = fetch_open_meteo(city.latitude, city.longitude, city.timezone, self.http_opener)
+            for d in self.city_dates(city):
+                if d in highs:
+                    rows.append((d, highs[d][0], highs[d][1], now,
+                                 f"{url} · {where} · issue time = retrieval time (model run time not provided)"))
+        else:
+            from .weather.nws import extract_daily_high, fetch_nws_raw
+            fc, url = fetch_nws_raw(city.latitude, city.longitude, self.cfg.weather.nws_user_agent, self.http_opener)
+            for d in self.city_dates(city):
+                p = extract_daily_high(fc, d)
+                if p:
+                    rows.append((d, p["expected_high"], p["unit"], p["issued_at"], f"{url} period={p['period_name']} · {where}"))
+        saved = 0
+        for d, value, unit, issued, detail in rows:
+            dup = self.store.one("SELECT 1 FROM forecasts WHERE series_ticker=? AND target_date=? AND source=? "
+                                 "AND issued_at=? AND expected_high=?",
+                                 (city.series_ticker, d.isoformat(), source, to_iso(issued), value))
+            if dup:
+                continue  # same NWS issuance already stored
+            self.add_forecast(target_date=d, expected_high=value, unit=unit, sigma=None, issued_at=issued,
+                              source=source, series_ticker=city.series_ticker, source_detail=detail)
+            saved += 1
+        return saved
+
+    def update(self, record_decisions: bool = False, force_forecasts: bool = False) -> dict:
+        """One-stop update: snapshot prices, fetch automatic forecasts, optionally record decisions."""
+        r = {"prices": self.refresh(), "forecasts": self.auto_forecasts(force_forecasts), "decisions": 0}
+        if record_decisions:
+            for t in self.todays_tickers():
+                self.record_decision(t)
+                r["decisions"] += 1
+        self.last_update = (self.clock(), r)
+        return r
 
     # ---------------------------------------------------------------- terms acknowledgment
     def ack_terms(self, ticker: str) -> int:

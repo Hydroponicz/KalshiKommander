@@ -67,8 +67,7 @@ def test_server_rejects_foreign_host_and_origin(app):
         srv.shutdown()
 
 
-def test_nws_button_only_when_enabled(app):
-    d = Dashboard(app)
-    assert "Fetch NWS forecast" not in d.index({})
-    app.cfg.weather.provider = "nws"
-    assert "Fetch NWS forecast" in d.index({})
+def test_sample_mode_says_auto_forecasts_off(app):
+    page = Dashboard(app).index({})
+    assert "Automatic forecasts are off in sample mode" in page
+    assert "Refresh prices for all cities" in page

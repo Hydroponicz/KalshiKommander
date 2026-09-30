@@ -47,10 +47,14 @@ def extract_daily_high(forecast_json: dict, target: date) -> dict | None:
     return None
 
 
-def fetch_nws_forecast(lat: float, lon: float, target: date, user_agent: str, opener=None) -> tuple[dict | None, dict]:
+def fetch_nws_raw(lat: float, lon: float, user_agent: str, opener=None) -> tuple[dict, str]:
     point = _get(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", user_agent, opener)
     url = (point.get("properties") or {}).get("forecast")
     if not url or not url.startswith("https://api.weather.gov/"):
         raise RuntimeError("NWS points response had no forecast URL")
-    fc = _get(url, user_agent, opener)
-    return extract_daily_high(fc, target), {"points_url": point.get("id"), "forecast_url": url, "forecast": fc}
+    return _get(url, user_agent, opener), url
+
+
+def fetch_nws_forecast(lat: float, lon: float, target: date, user_agent: str, opener=None) -> tuple[dict | None, dict]:
+    fc, url = fetch_nws_raw(lat, lon, user_agent, opener)
+    return extract_daily_high(fc, target), {"forecast_url": url, "forecast": fc}

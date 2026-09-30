@@ -17,6 +17,7 @@ from .timeutil import to_iso
 APPEND_ONLY_TABLES = [
     "market_snapshots", "orderbook_snapshots", "forecasts", "estimates", "decisions",
     "paper_orders", "paper_fills", "cash_ledger", "settlements", "terms_acks", "tracked_series",
+    "city_locations",
 ]
 
 SCHEMA = """
@@ -67,6 +68,9 @@ CREATE TABLE IF NOT EXISTS settlements (
 CREATE TABLE IF NOT EXISTS tracked_series (
   id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, action TEXT NOT NULL CHECK (action IN ('track','untrack')),
   series_ticker TEXT NOT NULL, label TEXT, timezone TEXT, latitude REAL, longitude REAL);
+CREATE TABLE IF NOT EXISTS city_locations (
+  id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, series_ticker TEXT NOT NULL,
+  latitude REAL NOT NULL, longitude REAL NOT NULL, note TEXT);
 CREATE TABLE IF NOT EXISTS terms_acks (
   id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, ticker TEXT NOT NULL,
   market_snapshot_id INTEGER NOT NULL REFERENCES market_snapshots(id), rules_sha TEXT NOT NULL);

@@ -61,6 +61,15 @@ def main(argv=None) -> int:
     ut.add_argument("series")
     s = sub.add_parser("serve", help="run the local dashboard")
     s.add_argument("--port", type=int)
+    s.add_argument("--auto-update", type=int, metavar="MINUTES",
+                   help="also update prices+forecasts every N minutes (default: [auto] update_every_minutes)")
+    up = sub.add_parser("update", help="one-shot: refresh prices, fetch automatic forecasts, record decisions")
+    up.add_argument("--no-decisions", action="store_true", help="don't record decision snapshots")
+    up.add_argument("--force", action="store_true", help="fetch forecasts even if fetched recently")
+    lo = sub.add_parser("set-location", help="set the forecast location for a city")
+    lo.add_argument("series")
+    lo.add_argument("lat", type=float)
+    lo.add_argument("lon", type=float)
     f = sub.add_parser("add-forecast", help="record a manually sourced forecast")
     f.add_argument("--city", help="series ticker (required when following more than one city)")
     f.add_argument("--date", required=True)
@@ -103,7 +112,8 @@ def _run(args, app, cfg) -> int:
         print(json.dumps(app.refresh(args.city), indent=2))
     elif args.cmd == "cities":
         for c in app.cities():
-            print(f"{c.series_ticker:<18} {c.name:<22} {c.timezone:<22} ({c.origin})")
+            loc = f"{c.latitude:.4f},{c.longitude:.4f} ({c.location_note})" if c.latitude is not None else "no location"
+            print(f"{c.series_ticker:<18} {c.name:<22} {c.timezone:<22} ({c.origin})  {loc}")
     elif args.cmd == "track":
         app.track_city(args.series, args.label, args.timezone, args.lat, args.lon)
         print(f"following {args.series}")
@@ -112,7 +122,16 @@ def _run(args, app, cfg) -> int:
         print(f"stopped following {args.series}")
     elif args.cmd == "serve":
         from .web import serve
-        serve(app, cfg.host, args.port or cfg.port)
+        every = cfg.auto.update_every_minutes if args.auto_update is None else args.auto_update
+        if every and every < 5:
+            raise ValueError("--auto-update must be at least 5 minutes")
+        serve(app, cfg.host, args.port or cfg.port, every)
+    elif args.cmd == "update":
+        r = app.update(record_decisions=not args.no_decisions, force_forecasts=args.force)
+        print(json.dumps(r, indent=2, default=str))
+    elif args.cmd == "set-location":
+        app.set_location(args.series.upper(), args.lat, args.lon)
+        print(f"location saved for {args.series.upper()}")
     elif args.cmd == "add-forecast":
         fid = app.add_forecast(target_date=date.fromisoformat(args.date), expected_high=args.high, unit=args.unit,
                                sigma=args.sigma, issued_at=parse_local_input(args.issued, app.tz),

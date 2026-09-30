@@ -3,7 +3,7 @@
 A local research and **PAPER / SIMULATED** trading tool for Kalshi daily-high-temperature markets.
 
 - It reads Kalshi's **public** market data. You don't need an account, API key, deposit or payment details.
-- You enter weather forecasts by hand, with their sources. There is also an optional helper that fetches a forecast from api.weather.gov.
+- Weather forecasts arrive **automatically** from a free service (Open-Meteo by default, or the US National Weather Service), or you can enter your own.
 - It estimates P(YES) with a simple model that is documented below and is **not calibrated**.
 - It compares that estimate with the **executable ask**, after fees, slippage and a safety margin.
 - It records every input, estimate, quote and decision as an **append-only**, timestamped snapshot.
@@ -54,13 +54,42 @@ Each city is one Kalshi daily-high-temperature series. Prices, forecasts, decisi
    series_ticker = "KXHIGHCHI"
    label = "Chicago"
    timezone = "America/Chicago"   # the city's timezone: decides what "today" means for its markets
-   # latitude = 41.79             # optional, only for the NWS forecast button
+   # latitude = 41.79             # optional: forecast location (known cities get a suggested station)
    # longitude = -87.75
    ```
 
 The older single-city `[market] series_ticker` setting still works and shows up as one city. Forecasts saved before multi-city support stay attached to that city.
 
 On the command line, pass `--city SERIES` to `add-forecast`, `nws` and `refresh` when you follow more than one city.
+
+### Automatic forecasts (no typing needed)
+
+With real data, every **Update prices & forecasts** click also fetches today's and tomorrow's expected high for each city. The provider is set in `config.toml`:
+
+```toml
+[weather]
+provider = "open_meteo"   # default. "nws" = US National Weather Service, "manual" = off
+refetch_minutes = 60      # fetch at most this often per city
+```
+
+Each city needs a **forecast location**, ideally the weather station its contracts settle on. New York, Chicago, Austin, Miami, Los Angeles, Philadelphia and Denver get a suggested station automatically (for example Chicago → Midway Airport). These are taken from public guides, so check them against the station named in the contract rules. Change or set a location on the **Cities** page ("Change location") or with `python -m kalshikommander set-location KXHIGHCHI 41.7861 -87.7522`.
+
+**Hands-free mode.** Start the dashboard with `python -m kalshikommander serve --auto-update 15` (or set `[auto] update_every_minutes = 15`). While it runs, every 15 minutes it:
+
+1. saves fresh prices,
+2. fetches forecasts that are due, and
+3. records a timestamped decision for every contract (turn this off with `[auto] record_decisions = false`).
+
+Paper orders are never placed automatically; you still click **Simulate paper order**.
+
+If the dashboard isn't running, `python -m kalshikommander update` does the same once. You can schedule it with Windows Task Scheduler.
+
+What stays manual, on purpose:
+
+- **Reading each contract's rules once and confirming.**
+- **The "±" uncertainty**, which is a configured assumption (`[model] default_sigma_f`), not something the weather services provide.
+
+A forecast you type yourself is still accepted. Whichever forecast was issued most recently is used.
 
 ### Switching to real Kalshi public data
 
@@ -89,7 +118,10 @@ Sample data and real data use separate databases: `data/sample.db` and `data/kal
 | `cities` / `track SERIES --timezone TZ [--label NAME]` / `untrack SERIES` | List, follow or stop following cities. |
 | `serve [--port N]` | Run the dashboard, bound to 127.0.0.1 only. |
 | `add-forecast [--city SERIES] --date 2026-10-01 --high 74 --unit F [--sigma 3] --issued 2026-09-30T16:00 --source "NWS forecast page" [--detail URL]` | Record a forecast. |
-| `nws [--city SERIES] --date YYYY-MM-DD` | Optional: record an NWS gridpoint forecast. Needs `provider="nws"` and a latitude/longitude. |
+| `update [--no-decisions] [--force]` | One-shot: refresh prices, fetch automatic forecasts, record decisions. |
+| `set-location SERIES LAT LON` | Set a city's forecast location. |
+| `serve --auto-update MINUTES` | Dashboard plus automatic updates every N minutes (minimum 5). |
+| `nws [--city SERIES] --date YYYY-MM-DD` | Record an NWS gridpoint forecast for one day by hand. |
 | `decide [--ticker T ...]` | Record timestamped estimate and decision snapshots. |
 | `paper-execute <decision_id>` | Simulate a stored BUY decision against *its own* order-book snapshot. |
 | `settle <ticker> yes\|no --source "..." [--observed-high 77]` | Record a settlement by hand. |
@@ -112,9 +144,9 @@ Verdict colours always come with an icon and a label: green ✓ = paper-buy sign
 
 ## Daily workflow
 
-1. **Refresh** to snapshot the markets and order books.
+1. Click **Update prices & forecasts** (or leave `serve --auto-update 15` running). This snapshots the markets and order books and fetches forecasts.
 2. Open a contract. **Read the verbatim rules.** If the "Interpreted YES set" matches them, click the acknowledgment. The acknowledgment is tied to a hash of that exact rules text, so a rules change requires a new acknowledgment.
-3. **Enter a forecast** with its source, the forecast's *issue* time, the expected high and your uncertainty σ.
+3. Check the forecast. It arrives automatically, or you can enter one with its source, *issue* time, expected high and uncertainty σ.
 4. **Record a decision snapshot**. You get either a BUY decision or NO_TRADE with reasons.
 5. For a BUY, optionally **Simulate paper order**.
 6. After the market closes, use **Fetch settled results** or record the result manually. Then check **Evaluation**.
@@ -128,7 +160,7 @@ The components are separate and each can be tested on its own.
 | Market data (read-only) | `marketdata/kalshi_public.py`, `marketdata/sample.py` | GET-only, with an allowlist of paths: `/series`, `/events`, `/markets`, `/markets/{t}/orderbook`. |
 | Contract terms | `contracts.py` | Uses the structured strike fields, checks them against the verbatim rules, and never reads the title. |
 | Order book | `orderbook.py` | Book lists bids only. YES ask = 1 − best NO bid, and vice versa. |
-| Forecasts | `service.add_forecast`, `weather/nws.py` | Manual entry by default. The NWS provider is optional. |
+| Forecasts | `service.add_forecast` / `auto_forecasts`, `weather/open_meteo.py`, `weather/nws.py` | Automatic (Open-Meteo or NWS) or manual. |
 | Model | `probability.py` | Pure function. |
 | Fees | `fees.py` | Pure function. |
 | Decision | `decision.py` | Pure function. Returns NO_TRADE with reasons. |
@@ -154,7 +186,19 @@ The components are separate and each can be tested on its own.
 - The contract link points to the series page, `https://kalshi.com/markets/<series>`. That URL pattern is assumed. The series `contract_url` is shown when the data provides one.
 - Settlement sources can change. Secondary reports say high/low series moved from NWS to another reporting authority in 2026. Always read the rules shown for *each* market; the app does not assume a source.
 
-**NWS api.weather.gov (optional provider)** is free and needs no key, but it requires a User-Agent.
+**Open-Meteo (default automatic provider)** is at `api.open-meteo.com`. It is free, needs no key, and the free tier is for non-commercial use.
+
+- **Coverage:** worldwide. It blends national weather models, about 1–11 km grid.
+- **Units:** requested in °F. The response's unit is checked.
+- **Timezone:** requested in the city's timezone, so the daily maximum covers that city's local calendar day. That is midnight to midnight clock time, not the local-standard-time day some official reports use.
+- **Update cadence:** models refresh every 1–6 hours. The API doesn't say when the model run was made, so the **retrieval time is stored as the issue time**. That's when the app knew the value, which is what matters for look-ahead safety, but the forecast can look fresher than it is.
+- **Limitations:**
+  - A grid forecast is not the settlement station's reading.
+  - It gives no uncertainty, so σ stays your assumption.
+  - Missing values are skipped, never filled in.
+- **Not reachable from the build environment**, so it is tested only with a fixture.
+
+**NWS api.weather.gov (optional automatic provider, `provider = "nws"`)** is free and needs no key, but it requires a User-Agent.
 
 - **Coverage:** the US only.
 - **Units:** the forecast's `temperatureUnit`, normally °F.
@@ -173,7 +217,7 @@ The components are separate and each can be tested on its own.
 1. Open the **Cities** page (or run `discover --check-open`) and pick a series that has open events.
 2. Open one of its markets in the dashboard. Read the settlement source, the station and the verbatim rules.
 3. Confirm the city's timezone. It decides which contracts count as "today" for that city.
-4. If you use NWS, set a latitude/longitude close to the **settlement station** (in `[[cities]]` or with `track --lat --lon`).
+4. Make sure the city's **forecast location** is the settlement station (Cities page → Change location, `set-location`, or `[[cities]]`).
 
 Prefer a city where you can find a documented, timestamped forecast source you'll use consistently.
 

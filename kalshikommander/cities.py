@@ -36,6 +36,33 @@ def guess_timezone(text: str) -> str | None:
     return None
 
 
+# SUGGESTED forecast points: the weather station each city's Kalshi market is reported to settle
+# on (per public guides, not verified here). Always compare with the station named in the rules.
+# keywords (whole word) -> (station description, latitude, longitude)
+_STATION_HINTS = [
+    (("NYC", "New York"), ("Central Park, NY (KNYC)", 40.7789, -73.9692)),
+    (("Chicago",), ("Chicago Midway Airport (KMDW)", 41.7861, -87.7522)),
+    (("Austin",), ("Austin-Bergstrom Airport (KAUS)", 30.1831, -97.6799)),
+    (("Miami",), ("Miami International Airport (KMIA)", 25.7881, -80.3169)),
+    (("Los Angeles", "LA", "LAX"), ("Los Angeles International Airport (KLAX)", 33.9382, -118.3870)),
+    (("Philadelphia",), ("Philadelphia International Airport (KPHL)", 39.8683, -75.2311)),
+    (("Denver",), ("Denver International Airport (KDEN)", 39.8466, -104.6562)),
+]
+
+
+_TICKER_HINTS = {"KXHIGHNY": "New York", "KXHIGHCHI": "Chicago", "KXHIGHAUS": "Austin", "KXHIGHMIA": "Miami",
+                 "KXHIGHLAX": "Los Angeles", "KXHIGHPHIL": "Philadelphia", "KXHIGHDEN": "Denver"}
+
+
+def suggest_station(text: str, series_ticker: str = "") -> tuple[str, float, float] | None:
+    text = f"{text or ''} {_TICKER_HINTS.get((series_ticker or '').upper(), '')}"
+    for words, station in _STATION_HINTS:
+        for w in words:
+            if re.search(rf"(?<![A-Za-z]){re.escape(w)}(?![A-Za-z])", text or ""):
+                return station
+    return None
+
+
 def guess_label(title: str, ticker: str) -> str:
     m = re.search(r"\bin\s+(.+?)\??$", title or "")
     return (m.group(1).strip() if m else "") or ticker
@@ -49,6 +76,7 @@ class City:
     latitude: float | None = None
     longitude: float | None = None
     origin: str = "config"   # "config" | "dashboard" | "sample"
+    location_note: str = ""  # where latitude/longitude came from
 
     @property
     def name(self) -> str:
