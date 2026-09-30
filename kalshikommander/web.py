@@ -234,8 +234,9 @@ def risk_room(notes: list[str]) -> str:
 
 
 class Dashboard:
-    def __init__(self, app: App):
+    def __init__(self, app: App, updater: "BackgroundUpdater | None" = None):
         self.app = app
+        self.updater = updater  # when set, updates run in the background instead of inside the request
 
     # ------------------------------------------------------------ helpers
     def lt(self, ts, tz: str | None = None, fmt: str = "%b %d, %I:%M %p %Z") -> str:
@@ -270,7 +271,9 @@ class Dashboard:
         fl = f"<div class='flash{' err' if err else ''}' role='status'>{E(flash)}</div>" if flash else ""
         return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
                 f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                f"<title>{E(title)} · KalshiKommander</title><style>{CSS}</style></head><body>"
+                f"<title>{E(title)} · KalshiKommander</title><style>{CSS}</style>"
+                + ("<meta http-equiv='refresh' content='10'>" if getattr(self.app, "update_running", False) else "")
+                + "</head><body>"
                 f"<header><div class='row'><span class='brand'>KalshiKommander</span>"
                 f"<span class='badge paper'>{PAPER_LABEL}</span>{tag}<nav>{nav}</nav></div></header>"
                 f"<main>{fl}{body}</main><footer>Research tool. Every trade here is simulated with virtual money — "
@@ -371,6 +374,8 @@ class Dashboard:
                         + (f", {r['decisions']} decisions recorded" if r["decisions"] else "")
                         + (f", {len(r.get('settled') or [])} results recorded" if r.get("settled") else "") + "."
                         + (f" {pill('warn', 'Problems')} {E('; '.join(probs[:3]))}" if probs else ""))
+        if getattr(app, "update_running", False):
+            last = f" {pill('warn', 'Updating now…')} This page refreshes itself every 10 seconds until it's done." + last
         return f"<p class='small' style='margin:-6px 0 14px'>{fc}{loop}{last}</p>"
 
     def _rules_banner(self, city: City) -> str:
@@ -1015,6 +1020,11 @@ class Dashboard:
                                    series_ticker=g("series") or None, source_detail=g("source_detail"), notes=g("notes"))
             return f"Saved forecast #{fid}."
         if path == "/update":
+            if self.updater is not None:
+                if not self.updater.trigger():
+                    return "An update is already running. This page refreshes itself until it's done."
+                return ("Update started in the background (usually under a minute, longer with many cities). "
+                        "This page refreshes itself until it's done.")
             r = app.update()
             f = r["forecasts"]
             msg = f"Saved fresh prices for {r['prices']['markets']} contracts"
@@ -1161,35 +1171,75 @@ def make_handler(dash: Dashboard, allowed_hosts: set[str]):
     return Handler
 
 
-def serve(app: App, host: str, port: int, every_minutes: int = 0):
-    """Serve the dashboard. With every_minutes > 0, also run app.update() on that schedule.
+class BackgroundUpdater:
+    """Runs app updates in a background thread so the dashboard always stays responsive.
 
-    Requests and updates run in the same thread (one after another), so the database is never
-    written from two threads at once."""
-    import time
-    httpd = HTTPServer((host, port), make_handler(Dashboard(app), {"127.0.0.1", "localhost", "::1"}))
-    httpd.timeout = 1.0
+    The worker uses its own App + database connection (SQLite WAL handles the concurrency).
+    With every_minutes > 0 it updates on that schedule (starting immediately) and each update
+    also records decisions / paper trades per [auto]; the Update button just runs one sooner.
+    With every_minutes == 0 it only runs when the button is pressed (prices, forecasts, results)."""
+
+    def __init__(self, ui_app: App, every_minutes: int, make_worker):
+        import threading
+        self.ui_app, self.every, self._make_worker = ui_app, every_minutes, make_worker
+        self._wake = threading.Event()
+        self.running = False
+        self._thread = threading.Thread(target=self._loop, name="kk-updater", daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def trigger(self) -> bool:
+        if self.running:
+            return False
+        self._wake.set()
+        return True
+
+    def _loop(self):
+        worker = self._make_worker()
+        if not self.every:
+            self._wake.wait()
+        while True:
+            self._wake.clear()
+            self._run_once(worker)
+            self._wake.wait(timeout=self.every * 60 if self.every else None)
+
+    def _run_once(self, worker: App):
+        cfg = worker.cfg
+        scheduled = bool(self.every)
+        self.running = self.ui_app.update_running = True
+        print("[update] started - the dashboard stays usable meanwhile")
+        try:
+            r = worker.update(record_decisions=scheduled and cfg.auto.record_decisions,
+                              paper_trade=scheduled and cfg.auto.record_decisions and cfg.auto.paper_trade)
+            probs = r["prices"]["errors"] + r["forecasts"]["errors"] + r["follow"]["needs_attention"]
+            print(f"[update] done: {len(r['follow']['added'])} new cities, {r['prices']['markets']} prices, "
+                  f"{r['forecasts']['saved']} forecasts, {r['decisions']} decisions, {len(r['paper_trades'])} paper trades, "
+                  f"{len(r['settled'])} results" + (f"; problems: {probs[:5]}" if probs else ""))
+            self.ui_app.last_update = worker.last_update
+        except Exception as e:
+            self.ui_app.last_update = (worker.clock(), {"error": str(e)})
+            print(f"[update] failed: {e}")
+        finally:
+            self.running = self.ui_app.update_running = False
+
+
+def serve(app: App, host: str, port: int, every_minutes: int = 0):
+    """Serve the dashboard; updates (scheduled or button-triggered) run in a background thread."""
+    from .service import make_source
+    from .storage import Store
+    updater = BackgroundUpdater(app, every_minutes,
+                                lambda: App(app.cfg, source=make_source(app.cfg), store=Store(app.cfg.db_path))).start()
+    httpd = HTTPServer((host, port), make_handler(Dashboard(app, updater), {"127.0.0.1", "localhost", "::1"}))
     app.auto_every = every_minutes
-    print(f"{PAPER_LABEL} dashboard: http://{host}:{port}/  (Ctrl+C to stop)")
+    print(f"{PAPER_LABEL} dashboard ready: http://{host}:{port}/  (Ctrl+C to stop)")
     if every_minutes:
-        print(f"Auto-update every {every_minutes} min: cities + prices + forecasts + results"
+        print(f"Auto-update every {every_minutes} min in the background: cities + prices + forecasts + results"
               + (" + decision snapshots" if app.cfg.auto.record_decisions else "")
               + (" + PAPER trades" if app.cfg.auto.record_decisions and app.cfg.auto.paper_trade else ""))
-    next_due = time.monotonic() if every_minutes else None
+    print("Tip (Windows): clicking inside this window can pause the app; press Esc if the title says 'Select'.")
     try:
-        while True:
-            httpd.handle_request()
-            if next_due is not None and time.monotonic() >= next_due:
-                next_due = time.monotonic() + every_minutes * 60
-                try:
-                    r = app.update(record_decisions=app.cfg.auto.record_decisions,
-                                   paper_trade=app.cfg.auto.record_decisions and app.cfg.auto.paper_trade)
-                    print(f"[auto-update] {len(r['follow']['added'])} new cities, {r['prices']['markets']} prices, "
-                          f"{r['forecasts']['saved']} forecasts, {r['decisions']} decisions, "
-                          f"{len(r['paper_trades'])} paper trades, {len(r['settled'])} results" + (f"; problems: {r['prices']['errors'] + r['forecasts']['errors']}"
-                                                          if r['prices']['errors'] or r['forecasts']['errors'] else ""))
-                except Exception as e:
-                    app.last_update = (app.clock(), {"error": str(e)})
-                    print(f"[auto-update] failed: {e}")
+        httpd.serve_forever()
     except KeyboardInterrupt:
         pass
